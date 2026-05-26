@@ -15,6 +15,16 @@
 
 namespace deep_gemm {
 
+/*
+LaunchRuntime: runtime kernel template(jit / launchkernel)
+generate_impl: c++ code generator for template specialization
+launch_impl: receive kernel args(generate during runtime) and launch kernel
+
+1. generate
+2. compiler->build
+3. launch
+LaunchRuntime is similar to python runtime compiler
+*/
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
     struct Args {
@@ -107,7 +117,10 @@ static void __instantiate_kernel() {{
         ));
     }
 };
-
+/*
+real kernel path: deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+cumulative_local_expert_recv_stats: recv token state per local expert
+*/
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
@@ -133,7 +146,14 @@ static void sm100_fp8_fp4_mega_moe(
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens);
 
     // Make tensormap
+    /*
+    overview:
+    input_token -(dispatch reorder)-> l1_acts -(gemm1)-> gemm1 ans -(swiglu)-> l2_acts
+    mean:
+    make_tma_2d_desc(tensor, logical_col, logical_row, tile_col, tile_row, stride, swizzle_mode)
+    */
     constexpr int kGranK = 32;
+    // l1_acts: gemm1's input
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_max_pool_tokens,
                                                      config.block_k, config.load_block_m,

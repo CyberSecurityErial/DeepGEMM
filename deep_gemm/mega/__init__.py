@@ -12,7 +12,7 @@ except Exception as exception:
 
 from .. import _C
 
-
+# [MegaMoE]: create a symmbuffer, get buffer size and area
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  # MoE arguments

@@ -24,9 +24,52 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
 
     // Workspace bytes
+    // [Layout]: Workspace--meta data area;
     const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
     // Layouts
+    /*
+       [MegaMoE]:
+       workspace                        metadata
+       input_token_buffer               input token, fp8
+       input_sf_buffer                  fp8 scale factor
+       input_topk_idx_buffer            dst expert for each token
+       input_topk_weights_buffer        router weight for each token-expert route, ans=sum(w_i * E_i_topk_weight_cur_token(token)), [token_id, topk_id]
+       l1_token_buffer                  l1(after dispatch, gemm1 input) token, fp8, dispatch reorder input_token_buffer(row token-> row expert)
+       l1_sf_buffer                     l1 fp8 scale factor
+       l1_topk_weights_buffer           l1, after dispatch, token match local expert, [pooled token-expert pair]
+       l2_token_buffer                  l2(gemm1 + swiglu, gemm2 input) token, fp8
+       l2_sf_buffer                     l2 fp8 scale factor
+       combine_token_buffer             gemm2 output, will be combine
+
+       x -> router topk -> dispatch -> gemm1 -> swiglu -> gemm2 -> combine -> y
+       input_*  ->  l1_*  ->  l2_*  ->  combine_token_buffer
+    */
+    /*
+       Input buffers:
+       input_token_buffer
+       input_sf_buffer
+       input_topk_idx_buffer
+       input_topk_weights_buffer
+
+       Expert-dispatched GEMM1 inputs:
+       l1_token_buffer
+       l1_sf_buffer
+       l1_topk_weights_buffer
+
+       GEMM1 + SwiGLU
+
+       GEMM2 inputs:
+       l2_token_buffer
+       l2_sf_buffer
+
+       GEMM2 partial outputs:
+       combine_token_buffer
+
+       Combine output:
+       y
+    */
+    // [Layout]: Data--buffer size(bytes) 1d;
     const auto fp8_token_layout = layout::Data(hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
@@ -37,6 +80,7 @@ get_symm_buffer_size_for_mega_moe(
     const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
 
     // Input buffers
+    // [Layout]: Buffer--buffer 1d;
     const auto input_token_buffer = layout::Buffer(
         fp8_token_layout, 1, num_max_tokens_per_rank,
         workspace.get_end_ptr());
@@ -51,6 +95,7 @@ get_symm_buffer_size_for_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     // Buffer configs
+    // [Layout]: kCandidatebBlockM--M dim size enum; get_num_padded_sf_pool_tokens--get scale factor padding size when m dim==block_m
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
     int num_max_padded_sf_pool_tokens = 0;
     for (int block_m: layout::kCandidateBlockM) {
@@ -130,6 +175,16 @@ get_symm_buffer_size_for_mega_moe(
     return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
 }
 
+/*
+y: moe output(after combine) [num_tokens, hidden]
+l1_weights_tuple: gemm1 weight  <gemm1_weight, gemm1_weight_sf>
+l2_weights_tuple: gemm2 weight  <gemm2_weight, gemm2_weight_sf>
+sym_buffer: sym_buffer addr in local rank
+sym_buffer_ptrs[]: sym_buffer ptr in all rank
+recipe: only(1,1,32)
+activation: swiglu
+fast_math: if use fast_math path
+*/
 static void fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
