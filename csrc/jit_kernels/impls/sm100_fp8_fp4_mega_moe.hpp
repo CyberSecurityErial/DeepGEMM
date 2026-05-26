@@ -151,14 +151,35 @@ static void sm100_fp8_fp4_mega_moe(
     input_token -(dispatch reorder)-> l1_acts -(gemm1)-> gemm1 ans -(swiglu)-> l2_acts
     mean:
     make_tma_2d_desc(tensor, logical_col, logical_row, tile_col, tile_row, stride, swizzle_mode)
+    dispatch:
+    token0 ~ expert2.               [token0fore2]
+    token0 ~ expert5  -(dispatch)-> [token0fore5]
+    token1 ~ expert5                [token1fore5]
+    token2 ~ expert9                [token2fore9] (l1_acts: [num_max_pool_tokens, hidden])
+    num_max_pool_tokens != recv tokens
     */
     constexpr int kGranK = 32;
     // l1_acts: gemm1's input
+    // stride(-2) == dim0 == hidden, row pitch
+    // swizzle_acts_mode: more efficiency for shared memory transactions
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_max_pool_tokens,
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
+    // cute::UMMA::Major::MN, layout=MN-major
+    // num_padded_sf_pool_tokens >= num_max_pool_tokens(tile align) （row len, col dim)
+    // tilesize = sf_block_m * kGranK
+    /*
+    scale operation:
+        q = x / s, x = s * q
+    token per line
+        [ x0  x1  x2  ... x31 | x32 ... x63 | ...  ]
+    scale factor per line per K-Dim Block
+        [   s0                | s1           | ... ]
+    scale answer
+        [ q0  q1  q2  ... q31 | q32 ... q63 | ...  ]
+    */
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.sf_block_m, kGranK,

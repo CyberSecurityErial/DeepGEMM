@@ -18,6 +18,51 @@
 
 namespace deep_gemm {
 
+/*
+overview:
+    input_token -(dispatch reorder)-> l1_acts -(gemm1)-> gate / up -(swiglu)-> l2_acts
+        -(gemm2)-> combine_token_buffer -(combine)-> y
+mean:
+    input_token = input_token_buffer / input_sf_buffer / input_topk_idx_buffer / input_topk_weights_buffer
+    l1_acts = l1_acts / l1_acts_sf / l1_topk_weights
+    l2_acts = l2_acts / l2_acts_sf
+shape:
+    input_token_buffer:        [num_tokens, hidden]
+    input_sf_buffer:           [num_tokens, hidden / 32]
+    input_topk_idx_buffer:     [num_tokens, num_topk]
+    input_topk_weights_buffer: [num_tokens, num_topk]
+dispatch:
+    token0 ~ expert2                  [token0fore2]
+    token0 ~ expert5  -(dispatch)->   [token0fore5]
+    token1 ~ expert5                  [token1fore5]
+    token2 ~ expert9                  [token2fore9]
+    input_token_buffer:        [num_tokens, hidden]       -(route expand/scatter)-> l1_acts:    [num_max_pool_tokens, hidden]
+    input_sf_buffer:           [num_tokens, hidden / 32]  -(route scatter + transpose/pad)-> l1_acts_sf: [num_padded_sf_pool_tokens, hidden / 32]
+    input_topk_weights_buffer: [num_tokens, num_topk]     -(flatten/scatter)-> l1_topk_weights: [num_max_pool_tokens]
+    num_max_pool_tokens != recv tokens
+gemm1:
+    l1_acts [num_max_pool_tokens, hidden] x l1_weights [num_experts_per_rank, 2 * intermediate_hidden, hidden] -> gemm1 ans [num_max_pool_tokens, 2 * intermediate_hidden]
+    gemm1 ans -> gate [num_max_pool_tokens, intermediate_hidden] / up [num_max_pool_tokens, intermediate_hidden]
+swiglu:
+    gate / up [num_max_pool_tokens, intermediate_hidden] + l1_topk_weights [num_max_pool_tokens] -> l2_acts [num_max_pool_tokens, intermediate_hidden]
+    l2_acts_sf: [num_padded_sf_pool_tokens, intermediate_hidden / 32]
+gemm2:
+    l2_acts [num_max_pool_tokens, intermediate_hidden] x l2_weights [num_experts_per_rank, hidden, intermediate_hidden] -> gemm2 ans [num_max_pool_tokens, hidden]
+    gemm2 ans -> combine_token_buffer [num_topk, num_max_tokens_per_rank, hidden]
+combine:
+    combine_token_buffer [num_topk, num_tokens, hidden] -(topk reduce)-> y [num_tokens, hidden]
+*/
+
+/*
+kNumExpertsPerWave: schedule granularity(expert num), which pipeline block is influenced by it?
+STORE_BLOCK_M: epilogue m tile, write l2_acts & output
+kNumMaxPoolTokens: max token-expert num after dispatch, max line of l1_acts/l2_acts
+kNumPaddedSFPoolTokens: m-axis capacity of l1_acts_sf/l2_acts_sf
+kNumStages： pipe num of TMA & MMA
+
+
+
+*/
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
