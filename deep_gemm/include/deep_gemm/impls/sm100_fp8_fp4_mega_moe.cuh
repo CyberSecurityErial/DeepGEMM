@@ -407,16 +407,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+        // kNumTokensPerWarp * kNumTopk <= 32
+        // if kNumTopk == 4, kNumTokensPerWarp == 8
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
             // TODO: figure out better unrolling
             // Now, `unroll` is better than `unroll 8`
             #pragma unroll
+            // i is a subworker(process unit is a token)
+            // kWorkerNum = kSmNum * kNumDispatchWarpPerSM
+            // kWorkerId = sm_id*kNumDispatchWarpPerSM + warp_id
+            // kNumAllWorkerProcessPerStep = kWorkerNum * kNumTokensPerWarp
             for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
                  i < num_tokens;
                  i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
+                // real token may be less than kNumTokensPerWarp, and not every lane in the last warp is active
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                     expert_idx = static_cast<int>(
                         __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
@@ -428,9 +435,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
         // Count experts' tokens
+        // count token-expert pair
+        // traverse input_topk_idx_buffer[token_id, topk_id], if expert_idx>=0, atomicAdd+=1(process)
+        // use smem becase current read op occurs in single sm.
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(smem_expert_count + expert_idx, 1);
         });
+        // wait all dispatch thread finish expert counting.
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Get SM offset (~6.5 us)
@@ -443,6 +454,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
+        // regist "[tokens, expert] pair" to current rank's workspace
+        // 'process' include 3 sub functions:
+        // 
+        /*
+        const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);我记得之前已经做了一次这个操作给smem里面的smem_expert_count的分别位置的expert计数，记录每个本地expert被几个token选中，为什么这里还做了一次，
+
+const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);我记得之前已经做了一次这个操作给smem里面的smem_expert_count的分别位置的expert计数，记录每个本地expert被几个token选中，为什么这里还做了一次，
+        */
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
