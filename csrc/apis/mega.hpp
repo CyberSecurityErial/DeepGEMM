@@ -7,6 +7,7 @@
 #include "../jit/compiler.hpp"
 #endif
 #include "../jit/device_runtime.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 
 namespace deep_gemm::mega {
@@ -217,9 +218,19 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+    const auto get_grouped_ab_shape = [](const torch::Tensor& t) {
+        auto [num_groups, mn, k] = get_shape<3>(t);
+        if (t.scalar_type() == kPackedFP4)
+            k *= 2;
+        else
+            DG_HOST_ASSERT(t.scalar_type() == torch::kFloat8_e4m3fn);
+        return std::make_tuple(num_groups, mn, k);
+    };
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = arch_major == 9 ?
+        get_grouped_ab_shape(l1_weights):
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = arch_major == 9 ?
+        get_grouped_ab_shape(l2_weights):
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
@@ -229,10 +240,15 @@ static void fp8_fp4_mega_moe(
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
+    if (arch_major == 9) {
+        // TODO(sm90-mega-moe): replace this with Hopper-specific scale layout checks.
+        DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
+    } else {
+        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+    }
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -269,6 +285,19 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math);
+    } else if (arch_major == 9) {
+        sm90_fp8_fp4_mega_moe(y,
+                              l1_acts, l1_acts_sf,
+                              l2_acts, l2_acts_sf,
+                              l1_weights, l2_weights,
+                              l1_weights_sf, l2_weights_sf,
+                              cumulative_local_expert_recv_stats,
+                              sym_buffer_ptrs,
+                              rank_idx, num_max_tokens_per_rank,
+                              num_experts_per_rank,
+                              num_tokens, num_topk,
+                              hidden, intermediate_hidden,
+                              activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

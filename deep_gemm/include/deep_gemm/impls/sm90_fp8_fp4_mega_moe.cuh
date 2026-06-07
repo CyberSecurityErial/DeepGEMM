@@ -107,16 +107,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         input_topk_weights_layout, 1, kNumMaxTokensPerRank,
         input_topk_idx_buffer.get_end_ptr());
 
-    // SF and its buffer configs
-    constexpr uint32_t kNumUTCCPAlignedElems = 128;
-    DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
-
-    // UTCCP 4x32 transpose index mapping within each 128-element group.
-    const auto transform_sf_token_idx = [](const uint32_t& token_idx_in_expert) {
-        const uint32_t idx = token_idx_in_expert % BLOCK_M;
-        return token_idx_in_expert / BLOCK_M * SF_BLOCK_M +
-               (idx & ~127u) + (idx & 31u) * 4 + ((idx >> 5) & 3u);
-    };
+    // SM90 M0-M3 keeps the SF buffers in the shared workspace layout so host-side
+    // slicing remains compatible. Hopper-specific SF copy/reorder is intentionally
+    // deferred; do not inherit SM100 UTCCP/SFB token-index transforms here.
 
     // L1 dispatch buffers
     const auto l1_token_buffer = layout::Buffer(
@@ -148,6 +141,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchSmemExpertCountBytes = kNumExperts * sizeof(uint32_t);
 
     constexpr uint32_t kDispatchBarrierIdx = 0;
+    constexpr uint32_t kDispatchGridSyncIndex = 0;
+    constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
 
     // Dispatch warps only. MMA, epilogue, L2, and combine state intentionally stay out
     // of this scaffold while the Hopper dispatch path is being written.
@@ -215,15 +210,53 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 local_expert_idx, sym_buffer.rank_idx, dst_slot_idx);
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
-        // M3 grid/NVLink ordering is intentionally not implemented in this scaffold; no
-        // downstream reader may assume the remote metadata is visible until that barrier lands.
+
+        // [Dispatch M3/A]: all SMs on this source rank must finish src_token_topk_idx
+        // stores before SM 0 publishes counts to remote ranks. This preserves the
+        // downstream invariant that a visible recv count implies a complete source list.
+        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+            workspace, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+        );
+        // cuda kernel not support grid sync, so we use a gmem memory to achieve grid sync.
+
+        // [Dispatch M3/B]: finalize the destination rank's receive metadata.
+        // expert_send_count lives in this source rank's workspace; low32 is the number
+        // of slots written for this source rank, high32 is the producer-arrival count.
+        if (sm_idx == 0) {
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                const uint32_t dst_rank_idx = i / kNumExpertsPerRank;
+                const uint32_t dst_local_expert_idx = i % kNumExpertsPerRank;
+                const uint64_t expert_status = *workspace.get_expert_send_count_ptr(i);
+                *sym_buffer.map(
+                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                    dst_rank_idx) = expert_status & 0xffffffffull;
+                ptx::atomic_add_sys(
+                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                    expert_status);
+            }
+        }
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+        // [Dispatch M3/C]: publish the metadata phase across ranks. M4/M5 must only read
+        // src_token_topk_idx, expert_recv_count, and expert_recv_count_sum after this barrier.
+        // cta sync & grid sync < nvlink sync, so nvlink barrier's lambda func body is cta sync, and need a template parameter named kDispatchGridSyncIndex
+        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+            workspace, sym_buffer, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+            /* After the grid sync above, only SM 0 writes receive metadata */ false,
+            /* Later M4/M5 readers need a post-barrier grid sync */ true
+        );
+
+        // M4+ is intentionally out of scope for this scaffold.
 
         (void) cumulative_local_expert_recv_stats;
         (void) input_token_buffer;
         (void) input_sf_buffer;
         (void) input_topk_weights_buffer;
         (void) kDispatchSmemExpertCountBytes;
-        (void) transform_sf_token_idx;
         (void) l1_token_buffer;
         (void) l1_sf_buffer;
         (void) l1_topk_weights_buffer;

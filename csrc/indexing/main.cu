@@ -26,6 +26,7 @@
 #include <deep_gemm/impls/smxx_clean_logits.cuh>
 
 // Mega kernels
+#include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
