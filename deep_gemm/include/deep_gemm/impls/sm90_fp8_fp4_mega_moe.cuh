@@ -250,7 +250,133 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             /* Later M4/M5 readers need a post-barrier grid sync */ true
         );
 
-        // M4+ is intentionally out of scope for this scaffold.
+        // [Dispatch M4]: enumerate the finalized local expert pool. This maps each
+        // local pool entry to the source rank/token/topk slot that M5 will pull.
+        // Pool destinations are block-major, not a plain expert prefix sum:
+        //   pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert.
+        const auto enumerate_local_expert_pool = [&](const auto& process) {
+            // Cache expert token counts in registers (same pattern as the GEMM scheduler).
+            scheduler.fetch_expert_recv_count();
+
+            // Per-rank counts for current expert (re-loaded when expert changes).
+            constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
+            int current_expert_idx = -1;
+            uint32_t stored_rank_count[kNumRanksPerLane] = {};
+            uint32_t expert_start_idx = 0, expert_end_idx = 0;
+            uint32_t expert_pool_block_offset = 0;
+
+            constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+            for (uint32_t token_idx = sm_idx * kNumDispatchWarps + dispatch_warp_idx; ;
+                 token_idx += kNumGlobalWarps) {
+                // Advance expert until token_idx lands in the current expert receive range.
+                int old_expert_idx = current_expert_idx;
+                while (token_idx >= expert_end_idx) {
+                    if (++ current_expert_idx >= kNumExpertsPerRank)
+                        break;
+
+                    expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
+                    expert_start_idx = expert_end_idx;
+                    expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+                }
+
+                if (current_expert_idx >= kNumExpertsPerRank)
+                    break;
+
+                if (old_expert_idx != current_expert_idx) {
+                    old_expert_idx = current_expert_idx;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t rank_idx = i * 32 + lane_idx;
+                        stored_rank_count[i] = rank_idx < kNumRanks ?
+                            static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(rank_idx, current_expert_idx)) : 0;
+                    }
+                }
+
+                // Round-robin rank selection via iterative min-peeling. This matches
+                // the SM100 dispatch order and converts token_idx_in_expert to a
+                // per-source-rank slot in src_token_topk_idx.
+                uint32_t current_rank_in_expert_idx = 0;
+                uint32_t remaining[kNumRanksPerLane];
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                    remaining[i] = stored_rank_count[i];
+
+                uint32_t offset = 0;
+                const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+                uint32_t slot_idx = token_idx_in_expert;
+                uint32_t token_idx_in_rank = 0;
+                while (true) {
+                    uint32_t num_actives_in_lane = 0;
+                    uint32_t min_in_lane = 0xffffffffu;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        num_actives_in_lane += remaining[i] > 0;
+                        if (remaining[i] > 0)
+                            min_in_lane = remaining[i] < min_in_lane ? remaining[i] : min_in_lane;
+                    }
+                    const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
+                    const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
+
+                    const uint32_t num_round_tokens = length * num_active_ranks;
+                    if (slot_idx < num_round_tokens) {
+                        const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
+                        uint32_t num_seen_ranks = 0;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                            const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
+                            const uint32_t num_active_lanes = __popc(mask);
+                            if (slot_idx_in_round >= num_seen_ranks and
+                                slot_idx_in_round < num_seen_ranks + num_active_lanes) {
+                                current_rank_in_expert_idx =
+                                    i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                            }
+                            num_seen_ranks += num_active_lanes;
+                        }
+                        token_idx_in_rank = offset + (slot_idx / num_active_ranks);
+                        break;
+                    }
+
+                    slot_idx -= num_round_tokens;
+                    offset += length;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                        remaining[i] -= remaining[i] < length ? remaining[i] : length;
+                }
+
+                const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+                    current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+                const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
+                const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
+                const uint32_t pool_token_idx =
+                    expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+
+                process(pool_token_idx,
+                        static_cast<uint32_t>(current_expert_idx),
+                        token_idx_in_expert,
+                        current_rank_in_expert_idx,
+                        src_token_idx,
+                        src_topk_idx,
+                        src_token_topk_idx);
+            }
+        };
+
+        enumerate_local_expert_pool([&](const uint32_t& pool_token_idx,
+                                        const uint32_t& local_expert_idx,
+                                        const uint32_t& token_idx_in_expert,
+                                        const uint32_t& src_rank_idx,
+                                        const uint32_t& src_token_idx,
+                                        const uint32_t& src_topk_idx,
+                                        const uint32_t& src_token_topk_idx) {
+            (void) pool_token_idx;
+            (void) local_expert_idx;
+            (void) token_idx_in_expert;
+            (void) src_rank_idx;
+            (void) src_token_idx;
+            (void) src_topk_idx;
+            (void) src_token_topk_idx;
+        });
+
+        // M5+ is intentionally out of scope for this scaffold.
 
         (void) cumulative_local_expert_recv_stats;
         (void) input_token_buffer;
@@ -260,7 +386,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         (void) l1_token_buffer;
         (void) l1_sf_buffer;
         (void) l1_topk_weights_buffer;
-        (void) scheduler;
     }
 #endif
 }
