@@ -12,7 +12,11 @@ except Exception as exception:
 
 from .. import _C
 
-# [MegaMoE]: create a symmbuffer, get buffer size and area
+
+def _is_sm90() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  # MoE arguments
@@ -29,7 +33,12 @@ class SymmBuffer:
         self.intermediate_hidden = intermediate_hidden
 
         # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+        buffer_size_fn = (
+            _C.get_symm_buffer_size_for_sm90_mega_moe
+            if _is_sm90() else
+            _C.get_symm_buffer_size_for_mega_moe
+        )
+        num_bytes, slice_input_buffers = buffer_size_fn(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
@@ -62,7 +71,12 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: bool = True,
                                  activation: str = 'swiglu') -> SymmBuffer:
     # Token count must be aligned to block sizes
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    alignment_fn = (
+        _C.get_token_alignment_for_sm90_mega_moe
+        if _is_sm90() else
+        _C.get_token_alignment_for_mega_moe
+    )
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, alignment_fn())
 
     return SymmBuffer(
         group, num_experts,
@@ -72,16 +86,17 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     )
 
 
-def _interleave_l1_weights(l1_weights: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+def _interleave_l1_tensor(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
-    def interleave(t, gran: int = 8) -> torch.Tensor:
-        g, n, *rest = t.shape
-        half = n // 2
-        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
-        up = t[:, half:].reshape(g, half // gran, gran, *rest)
-        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    g, n, *rest = t.shape
+    half = n // 2
+    gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+    up = t[:, half:].reshape(g, half // gran, gran, *rest)
+    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
 
-    return interleave(l1_weights[0]), interleave(l1_weights[1])
+
+def _interleave_l1_weights(l1_weights: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _interleave_l1_tensor(l1_weights[0]), _interleave_l1_tensor(l1_weights[1])
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
@@ -105,6 +120,23 @@ def transform_weights_for_mega_moe(
     return l1_weights, l2_weights
 
 
+def transform_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """SM90 (Hopper) variant of `transform_weights_for_mega_moe`.
+
+    SM90 has no TMEM / UTCCP path, so the SF tensors are consumed directly by
+    WGMMA promote and don't need the 4x32 transpose. With block (128, 128)
+    weight quantization, weight SFs are read by the math warpgroup directly
+    from global memory in their natural ``(E, N/128, K/128)`` MN-major layout
+    and require no transformation. Only L1's gate/up FP8 weight interleave is
+    preserved.
+    """
+    l1_fp8, l1_sf = l1_weights
+    return (_interleave_l1_tensor(l1_fp8), l1_sf), l2_weights
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -115,6 +147,29 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
     _C.fp8_fp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (128, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    _C.fp8_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,

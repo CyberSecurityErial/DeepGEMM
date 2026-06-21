@@ -59,17 +59,25 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
         sync_scope();
 
-        // Update status and wait arrival (with 30s timeout, at 2 GHz)
-        constexpr int64_t kNumTimeoutCycles = 30ll * 2000000000ll;
+        // Update status and wait arrival (with 300s timeout, at 2 GHz)
+        constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout (30s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
+        !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
+                    // Device printf can make an already wedged Hopper communication
+                    // kernel substantially harder to terminate. Keep the detailed
+                    // diagnostic available behind an explicit compile-time switch.
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false);
+#else
+                    printf("DeepGEMM NVLink barrier timeout (300s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#endif
                 }
             }
         }
