@@ -139,6 +139,9 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
+For the experimental SM90 FP8 MegaMoE path and the single-node 8×H20
+validation procedure, see [`docs/SM90_MEGA_MOE_H20_TEST.md`](docs/SM90_MEGA_MOE_H20_TEST.md).
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

@@ -44,6 +44,13 @@ def run_case(
     assert args.intermediate_hidden % 128 == 0
     assert args.intermediate_hidden <= 4096
 
+    dist_print(
+        f'Case: tokens={num_tokens}, max_tokens={args.num_max_tokens_per_rank}, '
+        f'hidden={args.hidden}, intermediate={args.intermediate_hidden}, '
+        f'experts={args.num_experts}, topk={args.num_topk}',
+        once_in_node=True,
+    )
+
     sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
         args.num_experts,
@@ -115,17 +122,20 @@ def run_case(
     assert torch.isfinite(y).all()
     dist.barrier()
 
-    if args.ncu_profile_only:
+    if args.smoke_only or args.ncu_profile_only:
+        mode = 'NCU warmup' if args.ncu_profile_only else 'Smoke'
         dist_print(
-            f'NCU case: tokens={num_tokens}, hidden={args.hidden}, '
-            f'intermediate={args.intermediate_hidden}',
+            f'{mode} passed: tokens={num_tokens}, output is finite',
             once_in_node=True,
         )
         sym_buffer.destroy()
         return
 
     trace_path = (
-        os.path.join(args.trace_dir, f'sm90_mega_moe_rank{rank_idx}.json')
+        os.path.join(
+            args.trace_dir,
+            f'sm90_mega_moe_tokens{num_tokens}_rank{rank_idx}.json',
+        )
         if args.trace_dir
         else None
     )
@@ -136,6 +146,7 @@ def run_case(
         suppress_kineto_output=True,
         trace_path=trace_path,
         barrier=dist.barrier,
+        flush_l2=bool(args.flush_l2),
     )
 
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -180,6 +191,11 @@ def worker(
 
     capability = torch.cuda.get_device_capability()
     assert capability[0] == 9, f'SM90 is required, got {capability}'
+    dist_print(
+        f'Device: {torch.cuda.get_device_name()} capability={capability}, '
+        f'ranks={num_ranks}',
+        once_in_node=True,
+    )
 
     for num_tokens in args.tokens:
         run_case(args, rank_idx, num_ranks, group, num_tokens)
@@ -201,7 +217,9 @@ if __name__ == '__main__':
     parser.add_argument('--activation-clamp', type=float, default=10.0)
     parser.add_argument('--fast-math', type=int, default=1)
     parser.add_argument('--num-tests', type=int, default=30)
+    parser.add_argument('--flush-l2', type=int, choices=[0, 1], default=1)
     parser.add_argument('--trace-dir', type=str, default='')
+    parser.add_argument('--smoke-only', action='store_true')
     parser.add_argument('--ncu-profile-only', action='store_true')
     args = parser.parse_args()
 
