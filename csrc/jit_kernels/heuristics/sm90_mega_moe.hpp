@@ -198,9 +198,18 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_weights_mode = 128;
 
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+    const int num_experts_per_wave_auto = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
+    // Pingpong benefits from smaller waves once enough tokens exist to amortize
+    // the extra waves; keep tiny-token latency on the original heuristic.
+    const int num_experts_per_wave_tuned = num_tokens >= 8
+                                                ? std::min(num_experts_per_wave_auto, 8)
+                                                : num_experts_per_wave_auto;
+    const int num_experts_per_wave_override = get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE", 0);
+    const int num_experts_per_wave = num_experts_per_wave_override > 0
+                                         ? std::min(num_experts_per_wave_override, num_experts_per_rank)
+                                         : num_experts_per_wave_tuned;
 
     const int num_dispatch_threads = 64;
     const int num_non_epilogue_threads = 64;
@@ -269,9 +278,18 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const int swizzle_weights_mode = 128;
 
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+    const int num_experts_per_wave_auto = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
+    // On the H200/L20X default shape (32 local experts), large-token cooperative
+    // runs are more stable when the whole local expert set is one wave.
+    const int num_experts_per_wave_tuned = (num_tokens >= 1024 and num_experts_per_rank == 32)
+                                               ? 32
+                                               : num_experts_per_wave_auto;
+    const int num_experts_per_wave_override = get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE", 0);
+    const int num_experts_per_wave = num_experts_per_wave_override > 0
+                                         ? std::min(num_experts_per_wave_override, num_experts_per_rank)
+                                         : num_experts_per_wave_tuned;
 
     const int num_dispatch_threads = 64;
     const int num_non_epilogue_threads = 64;

@@ -1,0 +1,881 @@
+# SM90 MegaMoE Profiling Notes
+
+Date: 2026-06-23 UTC
+
+## Context
+
+- Repo workspace: `/home/chen/workspace/source_code/DeepGEMM`
+- Active PR code: upstream PR #360, commit `ec757bd`
+- Main branch in workspace: `work/sm90-megamoe-pr360`
+- Isolated worktree: `/home/chen/workspace/source_code/DeepGEMM/work/codex-pr360/src`
+- Isolated Python/CUDA env: `/home/chen/workspace/source_code/DeepGEMM/work/codex-pr360`
+- GPU: 8 x NVIDIA L20X, SM90
+- Host NVCC: 12.8. DeepGEMM warns that NVCC 12.9+ is preferred, but tests and benchmarks run.
+
+Helper scripts:
+
+- `work/codex-pr360/env.sh`: sets isolated `PYTHONPATH`, `CUDA_HOME`, `LD_LIBRARY_PATH`, `DG_JIT_CACHE_DIR`, and NCCL/NVSHMEM env vars.
+- `work/codex-pr360/profile_sm90_megamoe_ncu.sh`: NCU wrapper for one profiled rank plus peer ranks.
+
+## Log Style
+
+This note is meant to teach the optimization process, not just archive numbers.
+Each round should stay short and follow this shape:
+
+- Command: exact command or script.
+- Guess: what bottleneck I am testing, in plain words.
+- Result: only key numbers/counters.
+- Lesson: what this teaches about the kernel.
+- Next: the next test or code change.
+
+Rule of thumb:
+
+- If a change wins, record why I thought it might win.
+- If a change loses, record what bottleneck guess was wrong.
+- Avoid long theory unless it changes the next experiment.
+
+## Profiling Pass 1: Kernel Selection Sweep
+
+Goal: establish whether the first optimization target should be the auto routing heuristic or the SM90 kernel body.
+
+Common benchmark command shape:
+
+```bash
+source /home/chen/workspace/source_code/DeepGEMM/work/codex-pr360/env.sh
+cd /home/chen/workspace/source_code/DeepGEMM/work/codex-pr360/src
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=<unique-port>
+export DG_SM90_MOE_KERNEL=<auto|pingpong|cooperative>
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 \
+  --batches 1 2 4 8 16 32 64 128 256 512 1024 \
+  --num-tests 5
+```
+
+Auto routing details from source:
+
+- `fp8_mega_moe` uses pingpong when `num_tokens < DG_SM90_MOE_COOPERATIVE_THRESHOLD`.
+- Default threshold is `256`.
+- Cooperative starts at `num_tokens >= 256`.
+- L2 N-major scheduling starts when `tokens_per_expert >= 256`, so for default shape it first turns on at `num_tokens=1024`.
+
+Results:
+
+| tokens | auto us | pingpong us | cooperative us | current auto choice |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 148.7 | 148.8 | 314.0 | pingpong |
+| 2 | 216.2 | 216.3 | 271.6 | pingpong |
+| 4 | 308.1 | 306.9 | 399.1 | pingpong |
+| 8 | 372.2 | 373.6 | 474.7 | pingpong |
+| 16 | ~397 | 397.3 | 503.3 | pingpong |
+| 32 | ~402 | 402.5 | 515.5 | pingpong |
+| 64 | 408.2 | 408.2 | 525.1 | pingpong |
+| 128 | 417.6 | 420.2 | 536.6 | pingpong |
+| 256 | 555.7 | 612.4 | 555.7 | cooperative |
+| 512 | 816.9 | 883.9 | 817.6 | cooperative |
+| 1024 | 1310.0 | 1378.3 | 1308.3 | cooperative + N-major |
+
+Analysis:
+
+- The default `256` cooperative threshold looks reasonable for the default shape.
+- Pingpong is clearly better through `128` tokens.
+- Cooperative becomes better at `256+` tokens.
+- This pass does not expose an easy threshold-only optimization for the default shape.
+- Next useful step is NCU on representative points:
+  - `tokens=128`, pingpong: low-latency regime just before switch.
+  - `tokens=256`, cooperative: first cooperative regime.
+  - `tokens=1024`, cooperative + N-major: large-token throughput regime.
+
+Feedback / next action:
+
+- Do kernel-level NCU profiling on the three representative points above.
+- Use the NCU results to decide whether the bottleneck is dispatch/barrier, TMA/global memory, scheduler stalls, local memory, or math pipe utilization.
+
+## Correction: NCU Wrapper
+
+Command:
+
+```bash
+MASTER_PORT=29141 DG_SM90_MOE_KERNEL=pingpong \
+  work/codex-pr360/profile_sm90_megamoe_ncu.sh \
+  --output work/codex-pr360/profiles/ncu-t128-pingpong \
+  --batch 128 --kernel pingpong --master-port 29141
+```
+
+Result:
+
+- Warmup OK: `tokens=128`, pingpong, about `421 us`.
+- NCU failed: current NCU does not support `--lockstep-kernel-launch`.
+- Peer ranks stayed alive; killed only this failed run's processes.
+
+Why this point:
+
+- Existing script assumed another NCU CLI.
+- Profiling result is invalid until the launcher is fixed.
+
+Fix:
+
+- Changed wrapper to use `ncu --target-processes all` around the 8-rank spawn path.
+- Removed unsupported lockstep/communicator args.
+
+Next:
+
+- Rerun `tokens=128` pingpong NCU with the fixed wrapper.
+
+## Correction: Full NCU Replay Too Heavy
+
+Command:
+
+```bash
+MASTER_PORT=29142 DG_SM90_MOE_KERNEL=pingpong \
+  work/codex-pr360/profile_sm90_megamoe_ncu.sh \
+  --output work/codex-pr360/profiles/ncu-t128-pingpong \
+  --batch 128 --kernel pingpong --master-port 29142
+```
+
+Result:
+
+- Warmup OK: `tokens=128`, pingpong, about `422 us`.
+- NCU found `sm90_fp8_mega_moe_pingpong_impl`.
+- Application replay stayed on pass 1 too long; stopped it.
+- No leftover processes.
+
+Why this point:
+
+- Full sections + application replay are too heavy for the first signal on this multi-rank kernel.
+
+Next:
+
+- Use lighter profiling first: benchmark timing, config toggles, and only small NCU sections if needed.
+
+## Profiling Pass 2: N-major Toggle
+
+Command:
+
+```bash
+DG_SM90_MOE_KERNEL=cooperative DG_SM90_MOE_NMAJOR=<0|1> \
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 256 512 1024 --num-tests 7
+```
+
+Result:
+
+| tokens | N-major off us | N-major on us | take |
+| ---: | ---: | ---: | --- |
+| 256 | 554.5 | 559.1 | off slightly better |
+| 512 | 818.8 | 819.6 | same |
+| 1024 | 1313.8 | 1317.2 | off slightly better in this run |
+
+Why this point:
+
+- Auto only enables N-major at 1024.
+- HBM GB/s drops at 512+, so weight scheduling was a plausible quick win.
+
+Next:
+
+- Do not change N-major heuristic yet.
+- Test `num_experts_per_wave`; it controls wave balance and tail work.
+
+## Profiling Pass 3: Pingpong Experts Per Wave
+
+Command:
+
+```bash
+DG_SM90_MOE_KERNEL=pingpong DG_SM90_MOE_EXPERTS_PER_WAVE=<auto|4|8|16|32> \
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 64 128 --num-tests 7
+```
+
+Result:
+
+| wave | 64 tok us | 128 tok us | take |
+| ---: | ---: | ---: | --- |
+| auto | 410.2 | 417.8 | current default |
+| 4 | 414.2 | 420.5 | worse |
+| 8 | 401.0 | 408.0 | best |
+| 16 | 408.0 | 414.4 | close to auto |
+| 32 | 411.3 | 421.3 | worse |
+
+Why this point:
+
+- Threshold and N-major did not give a win.
+- `num_experts_per_wave` controls how much expert work is grouped per wave; too many waves add overhead, too few hurt balance/cache.
+- The shared heuristic picked `16` here; `8` may reduce per-wave tail/pressure for pingpong.
+
+Next:
+
+- Test `wave=8` across the whole pingpong range: `1 2 4 8 16 32 64 128`.
+- Only then change the default heuristic.
+
+## Profiling Pass 4: Wave=8 Full Pingpong Range
+
+Command:
+
+```bash
+DG_SM90_MOE_KERNEL=pingpong DG_SM90_MOE_EXPERTS_PER_WAVE=<auto|8> \
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 1 2 4 8 16 32 64 128 --num-tests 9
+```
+
+Result:
+
+| tokens | auto us | wave=8 us | take |
+| ---: | ---: | ---: | --- |
+| 1 | 150.5 | 166.5 | worse |
+| 2 | 215.3 | 230.0 | worse |
+| 4 | 310.3 | 310.7 | same |
+| 8 | 370.6 | 365.1 | better |
+| 16 | 395.4 | 388.9 | better |
+| 32 | 403.2 | 395.1 | better |
+| 64 | 407.7 | 400.9 | better |
+| 128 | 420.9 | 408.5 | better |
+
+Why this point:
+
+- Pass 3 showed `wave=8` helps at 64/128.
+- Need to avoid hurting tiny-token latency.
+
+Next:
+
+- Tune pingpong only: use `min(auto, 8)` for `num_tokens >= 8`.
+- Keep tiny tokens on old auto.
+- Rebuild and retest correctness + perf.
+
+## Optimization Highlight
+
+Compared with upstream PR #360 baseline, Optimization 1 improves the default auto path for `8-128` tokens, while leaving `1-4` and `256+` effectively unchanged.
+
+Measured speedup on the confirmation sweep:
+
+| tokens | before us | after us | speedup |
+| ---: | ---: | ---: | ---: |
+| 8 | 370.6 | 365.9 | 1.28% |
+| 16 | 395.4 | 388.7 | 1.72% |
+| 32 | 403.2 | 395.2 | 2.02% |
+| 64 | 407.7 | 401.3 | 1.59% |
+| 128 | 420.9 | 409.8 | 2.71% |
+
+Average speedup over `8-128`: about `1.86%`.
+
+How it was found:
+
+1. Auto vs pingpong/cooperative showed the 256 switch point was already reasonable.
+2. N-major on/off showed no real win.
+3. `num_experts_per_wave` sweep showed `wave=8` beat auto at 64/128.
+4. Full pingpong-range sweep showed `wave=8` hurts 1/2 tokens but helps 8-128.
+5. Final change: only cap pingpong wave to 8 when `num_tokens >= 8`.
+
+This is useful because the gain comes from host heuristic tuning, not kernel-body risk. It is a good base for further profiling.
+
+## Optimization 1: Pingpong Wave Cap
+
+Change:
+
+- File: `csrc/jit_kernels/heuristics/sm90_mega_moe.hpp`
+- Pingpong only: when `num_tokens >= 8`, use `min(auto_wave, 8)`.
+- Tiny tokens keep old auto wave.
+- Added `DG_SM90_MOE_EXPERTS_PER_WAVE` override for future tuning.
+
+Config check:
+
+| tokens | wave after change |
+| ---: | ---: |
+| 1 | 32 |
+| 8 | 8 |
+| 128 | 8 |
+
+Correctness:
+
+- `tests/test_mega_moe_sm90.py --num-processes 8 --layers 1 2 3 4 --fail-fast`
+- Result: `PASSED all 32 scenarios`, all `diff=0.0000`.
+
+Perf after change, default auto:
+
+| tokens | before us | after us | take |
+| ---: | ---: | ---: | --- |
+| 1 | 150.5 | 149.6 | same |
+| 2 | 215.3 | 217.6 | same/noise |
+| 4 | 310.3 | 310.4 | same |
+| 8 | 370.6 | 365.9 | +1.3% |
+| 16 | 395.4 | 388.7 | +1.7% |
+| 32 | 403.2 | 395.2 | +2.0% |
+| 64 | 407.7 | 401.3 | +1.6% |
+| 128 | 420.9 | 409.8 | +2.6% |
+| 256 | 555.7 | 557.2 | same |
+| 512 | 816.9 | 817.9 | same |
+| 1024 | 1310.0 | 1314.2 | same |
+
+Why this optimization:
+
+- Threshold and N-major were not wins.
+- Wave sweep showed `wave=8` improves 8-128 tokens but hurts 1-2 tokens.
+- So the fix is conditional, not a global wave=8.
+
+Next:
+
+- Check cooperative wave tuning separately.
+
+## Validation Plan: Repeat A/B for Optimization 1
+
+Concern:
+
+- `1%-3%` is small enough to be noise-sensitive.
+
+Plan:
+
+- Use the optimized build for both sides.
+- `old`: set `DG_SM90_MOE_EXPERTS_PER_WAVE=16` to mimic PR #360 pingpong wave for 8-128.
+- `new`: unset override, using tuned default.
+- Run multiple alternating rounds on `8 16 32 64 128`.
+- Compare averages.
+
+## Bigger Ideas Beyond Heuristics
+
+Heuristic tuning is the low-risk first step. It proves PR #360 has headroom, but it is not the main path to fully squeeze performance.
+
+Non-trivial next ideas:
+
+1. Add lightweight device-side phase timers. Split time into dispatch, math loop, L1 epilogue, L2 epilogue, combine/reduce. This tells us where to cut.
+2. Reduce dispatch/barrier overhead for small tokens. 1-16 token cases are latency dominated; fewer waves or fewer global barriers may matter more than math throughput.
+3. Rework pingpong epilogue pressure. The wave=8 win suggests the old wave shape may create scheduler/register/barrier pressure, not pure math shortage.
+4. Cooperative weight reuse/TMA multicast. For large tokens, cooperative is DRAM/weight-reuse sensitive; cluster/TMA multicast could be a real win, but needs correct cross-CTA amax/SF handling.
+5. L2 scheduling by real routed tokens, not only expected tokens. Current heuristic uses expected distribution; actual topk imbalance may choose bad waves.
+
+Current direction:
+
+- Finish repeated A/B to prove Optimization 1 is real.
+- Then add phase timers and use them to pick the first kernel-body change.
+
+## Validation Result: 5-round A/B for Optimization 1
+
+Command:
+
+```bash
+old: DG_SM90_MOE_EXPERTS_PER_WAVE=16
+new: unset DG_SM90_MOE_EXPERTS_PER_WAVE
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 8 16 32 64 128 --num-tests 9
+```
+
+Result, 5 alternating rounds:
+
+| tokens | old avg us | new avg us | speedup |
+| ---: | ---: | ---: | ---: |
+| 8 | 372.84 | 366.18 | 1.82% |
+| 16 | 396.66 | 390.72 | 1.52% |
+| 32 | 402.98 | 396.60 | 1.61% |
+| 64 | 407.86 | 401.56 | 1.57% |
+| 128 | 416.72 | 411.14 | 1.36% |
+
+Average speedup: `1.57%`.
+
+Take:
+
+- The gain is real across repeated runs.
+- It is small; keep it, but bigger work must come from kernel internals.
+
+## Candidate 2: Optional Stats Counter Overhead
+
+Observation:
+
+- Python wrappers default `cumulative_local_expert_recv_stats=None`.
+- The SM90 bench always passes a stats tensor.
+- Kernel then does `red_add(cumulative_local_expert_recv_stats + i, num_recv_tokens)` once per local expert.
+- Normal perf path does not use this tensor unless profiling/debugging.
+
+Why this matters:
+
+- This is real kernel work: extra atomic/global writes in dispatch cleanup.
+- If benchmark always passes it, profiling includes optional stats overhead, not pure fast path.
+
+Test:
+
+- Change bench to pass `None` unless phase profiling is explicitly enabled.
+- Measure default performance again.
+
+## Candidate 2 Result: Optional Stats Counter
+
+Change tested:
+
+- Bench passed `None` for `cumulative_local_expert_recv_stats` unless phase profiling is enabled.
+
+Result:
+
+- No meaningful speedup. Example after no-stats: `8=364.4us`, `128=409.7us`, `1024=1312.0us`, roughly same as optimized build with stats.
+
+Take:
+
+- Counter overhead is not the main bottleneck.
+- Keep this as profiling hygiene only, not a performance win.
+
+## Tool Result: Lightweight NCU Still Hangs
+
+Command:
+
+```bash
+ncu --target-processes all \
+  --kernel-name regex:^sm90_fp8_mega_moe_.* \
+  --launch-count 8 \
+  --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed \
+  python3 tests/bench_mega_moe_sm90.py --num-processes 8 --ncu-profile-only --batches 128
+```
+
+Result:
+
+- NCU attaches to all 8 ranks and finds `sm90_fp8_mega_moe_pingpong_impl`.
+- It hangs at profiling 0%; stopped manually.
+- No leftover processes.
+
+Take:
+
+- Current NCU CLI/replay mode is not reliable for this multi-rank in-kernel-barrier workload.
+- Next profiling should use in-kernel lightweight timers or code-structured A/B, not more NCU retries.
+
+## Candidate 3: Fold Topk Weight Into Quant Scale
+
+Observation:
+
+- L1 epilogue computes `swiglu[]`, finds amax, then loops over `swiglu[] *= topk_weight`.
+- Later quantization loops over the same `swiglu[]` and multiplies by `sf_inv`.
+
+Idea:
+
+- Keep amax logic unchanged: `amax *= abs(weight)`.
+- Replace two-step multiply with `quant_scale = weight * sf_inv`.
+- Quantize as `swiglu * quant_scale`.
+- This removes the separate loop that mutates `swiglu[]`.
+
+Why this is non-trivial:
+
+- It changes actual kernel L1 epilogue instruction/register pressure, not host heuristic.
+- Applies to both pingpong and cooperative.
+
+Next:
+
+- Run correctness with a fresh JIT cache.
+- Then benchmark 8-128 and 256+ separately.
+
+## Roofline / Theoretical Limit Plan
+
+Add a ceiling model to every serious perf table.
+
+For each case:
+
+```text
+compute_lower_bound = FLOPs / peak_fp8_tensor_tflops
+hbm_lower_bound     = HBM_bytes / peak_hbm_GBps
+comm_lower_bound    = cross_rank_bytes / peak_link_GBps
+latency_lower_bound = launch + grid/NVLink barrier + unavoidable dispatch floor
+theory_lower_bound  = max(all lower bounds)
+headroom            = measured_time / theory_lower_bound
+```
+
+Table columns to add:
+
+| tokens | measured us | compute lb | HBM lb | comm lb | latency lb | tightest | headroom |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+
+Notes:
+
+- Compute and HBM estimates can use the benchmark's existing FLOPs/bytes model first.
+- Peak FP8/HBM/link numbers must be either measured locally or written as assumptions. Do not hide assumptions.
+- If the tightest lower bound is far below measured time, the missing gap is likely scheduler/barrier/epilogue/register pressure, not pure math or HBM.
+
+## Candidate 3 Result: Fold Topk Weight Into Quant Scale
+
+Correctness:
+
+- Fresh JIT cache.
+- `tests/test_mega_moe_sm90.py --num-processes 8 --layers 1 2 3 4 --fail-fast`
+- Result: `PASSED all 32 scenarios`.
+
+Perf A/B, 3 alternating rounds, large-token cooperative range:
+
+| tokens | old avg us | new avg us | speedup |
+| ---: | ---: | ---: | ---: |
+| 256 | 549.47 | 550.10 | -0.12% |
+| 512 | 808.40 | 810.03 | -0.20% |
+| 1024 | 1297.30 | 1295.43 | 0.14% |
+
+Average: `-0.06%`.
+
+Take:
+
+- The algebra is correct, but performance gain does not survive A/B.
+- Do not keep this as an optimization. Revert it.
+
+Why no improvement:
+
+1. The removed loop is small: `kNumPairs=8`, so only a handful of FP32 multiplies per row fragment.
+2. The L1 epilogue also has SiLU `exp`, amax reduction, FP8 conversion, TMA store, and arrival signaling. Those likely dominate this local multiply.
+3. The compiler may already schedule the original multiply loop into idle slots, so removing it does not reduce the critical path.
+4. Large-token cases are mostly cooperative/L2/weight-reuse dominated; L1 quant math is not the tightest bound there.
+
+Conclusion:
+
+- This points us away from tiny algebraic cleanups. Next kernel-body work should target phase-level bottlenecks: dispatch/barrier/TMA/combine, or cooperative weight reuse.
+
+## Bottleneck Hypotheses and Cases
+
+Do not guess blindly. Use cases that separate bottlenecks.
+
+| hypothesis | expected symptom | validation case |
+| --- | --- | --- |
+| HBM / weight traffic bound | time tracks touched experts / estimated HBM bytes | vary `num_experts` and `masked_ratio` |
+| compute bound | time tracks FLOPs when H/IH changes | vary `hidden` / `intermediate_hidden` |
+| dispatch/barrier latency bound | time flat even when FLOPs/routed tokens shrink | compare tiny tokens and high `masked_ratio` |
+| topk/combine bound | time grows with topk beyond math bytes | vary `num_topk` |
+| L1 epilogue / activation bound | `fast_math=0/1` or activation shape changes matter | vary `fast_math`, keep routing fixed |
+
+Next cases:
+
+1. `masked_ratio`: 0.0 vs 0.7 at tokens 128/512.
+2. `num_experts`: 128 vs 256 at tokens 128/512.
+3. `topk`: 1/2/4/8 at tokens 128.
+4. `hidden/IH`: smaller H/IH at tokens 128/512.
+
+## Bottleneck Validation: Designed Cases
+
+Command log:
+
+- `work/codex-pr360/profiles/bottleneck-cases-20260623-020018.log`
+
+Guess:
+
+- If runtime follows `recv` tokens, the bottleneck is mostly math/activation work.
+- If runtime follows `experts`, the bottleneck is per-expert scheduling, weight traffic, or workspace/barrier cleanup.
+- If runtime barely moves when useful work shrinks, the bottleneck is fixed dispatch/barrier/combine cost.
+
+Result:
+
+| case | tokens | recv | touched experts | time us | lesson |
+| --- | ---: | ---: | ---: | ---: | --- |
+| mask 0.0 | 128 | 1022 | 32 | 406.3 | baseline |
+| mask 0.7 | 128 | 318 | 32 | 396.3 | `recv` -69%, time only -2.5%: fixed/per-expert cost dominates small batch |
+| mask 0.0 | 512 | 4113 | 32 | 803.2 | baseline |
+| mask 0.7 | 512 | 1246 | 32 | 534.8 | bigger batch benefits from less real work: math/traffic matters here |
+| experts 128 | 128 | 988 | 16 | 322.2 | fewer local experts is much faster |
+| experts 256 | 128 | 1022 | 32 | 406.5 | default |
+| experts 512 | 128 | 1102 | 64 | 749.6 | many experts hurts badly: wave/workspace/weight working set pressure |
+| topk 1 | 128 | 129 | 31 | 383.6 | almost all experts still touched, so time stays high |
+| topk 8 | 128 | 1022 | 32 | 411.5 | 8x recv only costs +7.3% at 128 tokens |
+| default shape | 512 | 4113 | 32 | 802.7 | default H/IH |
+| half H/IH | 512 | 4042 | 32 | 268.0 | matrix size still matters a lot once work is large |
+
+Lesson:
+
+- For `8-128` tokens, do not think only in FLOPs. Most time is fixed path: dispatch counts, per-expert waves, barriers, combine, and touching many experts.
+- For `512+` tokens, matrix size and weight/GEMM traffic matter strongly.
+- This explains why Optimization 1 is small but real: changing wave shape trims fixed per-wave pressure, but it does not remove the deeper fixed path.
+
+Next:
+
+- Small batch: inspect/measure dispatch + combine + per-expert cleanup before doing more math micro-optimizations.
+- Large batch: focus on cooperative scheduling, weight reuse, and whether L2/SM utilization is below the H200-style bound.
+
+## Theory Bound: H200-style Lower Bound
+
+Assumption:
+
+- User confirmed the L20X parameter set should be treated the same as H200 here.
+- I use `1979 TFLOPS` FP8 tensor peak and `4800 GB/s` HBM as the simple device bounds.
+- Latency floor is taken from the best tiny-token measurement: about `149 us`.
+- This is a lower bound, not a prediction. If measured time is much higher, the missing part is scheduler/barrier/communication/epilogue overhead or poor utilization.
+
+| tokens | measured us | compute lb us | HBM lb us | latency lb us | tightest | headroom |
+| ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 1 | 149.6 | 0.3 | 64.3 | 149.0 | latency 149.0 us | 1.00x |
+| 8 | 365.9 | 2.8 | 238.9 | 149.0 | HBM 238.9 us | 1.53x |
+| 128 | 409.8 | 43.9 | 298.9 | 149.0 | HBM 298.9 us | 1.37x |
+| 256 | 557.2 | 92.3 | 304.6 | 149.0 | HBM 304.6 us | 1.83x |
+| 512 | 817.9 | 182.1 | 315.4 | 149.0 | HBM 315.4 us | 2.59x |
+| 1024 | 1314.2 | 364.0 | 337.3 | 149.0 | compute 364.0 us | 3.61x |
+
+How to read this:
+
+- `1 token`: already at the measured latency floor; little room unless we reduce fixed kernel path.
+- `8-128 tokens`: the benchmark byte model says HBM is the tightest simple bound, but measured is still `1.37x-1.53x` above it. That gap is where scheduling/barrier/combine work hides.
+- `512-1024 tokens`: headroom grows to `2.6x-3.6x`, so the large-batch path is not just raw HBM bandwidth. Cooperative scheduling, weight reuse, and math-pipe utilization need direct measurement.
+
+Important correction:
+
+- The failed topk-weight-fold optimization targeted a few FP32 multiplies in L1 epilogue. These tables explain why it did not move performance: that work is not the tightest bound.
+
+## Optimization 2: Cooperative Large-token Wave
+
+Why I looked here:
+
+- The theory table showed `512-1024` tokens still have large headroom.
+- Bottleneck cases showed large batches care about matrix/weight work, not only fixed dispatch.
+- Auto config print showed cooperative uses `wave=8` at `1024` tokens on the default 32-local-expert shape.
+
+Probe:
+
+```bash
+DG_SM90_MOE_KERNEL=cooperative \
+DG_SM90_MOE_EXPERTS_PER_WAVE=<auto|4|8|16|32> \
+python3 tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 256 512 1024 --num-tests 7
+```
+
+First signal:
+
+| wave | 256 us | 512 us | 1024 us | lesson |
+| ---: | ---: | ---: | ---: | --- |
+| auto | 555.0 | 815.5 | 1305.4 | baseline |
+| 4 | 571.6 | 844.0 | 1361.0 | too many small waves hurts |
+| 8 | 555.3 | 834.7 | 1312.3 | OK at 256, worse at 512 |
+| 16 | 556.2 | 815.6 | 1289.2 | close to auto, faster at 1024 in this run |
+| 32 | 557.8 | 815.1 | 1277.4 | best 1024 in this run |
+
+Guess:
+
+- At `1024` tokens, each expert has enough blocks that splitting the 32 local experts into smaller waves creates extra wave transition/barrier/scheduler pressure.
+- One wave over the whole local expert set is better for this default H200/L20X shape.
+
+Correction:
+
+- My first A/B launcher had a bad bash port expression and stopped after the first old run. Fixed the script and reran.
+- A config-print run made one 512-token timing huge due JIT/printing. I used it only to confirm config, not as perf data.
+
+Final A/B after rebuilding:
+
+- `old`: force `DG_SM90_MOE_EXPERTS_PER_WAVE=8`, matching old auto at 1024.
+- `new`: unset override, using the new default heuristic.
+- 5 alternating rounds, `--batches 1024 --num-tests 9`.
+
+| tokens | old avg us | new avg us | speedup |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1325.62 | 1310.68 | 1.14% |
+
+Change kept:
+
+- File: `csrc/jit_kernels/heuristics/sm90_mega_moe.hpp`
+- Cooperative only.
+- If `num_tokens >= 1024` and `num_experts_per_rank == 32`, use `num_experts_per_wave=32`.
+- This is deliberately narrow: it matches the measured H200/L20X default topology and avoids guessing for untested expert counts.
+
+Lesson:
+
+- This is still a heuristic optimization, but it came from a bottleneck hypothesis: large-token cooperative had scheduler/weight-reuse headroom.
+- The win is small but stable. Bigger wins likely need a real kernel feature: phase timers first, then weight-reuse/scheduler changes.
+
+## Final Result After Two Kept Optimizations
+
+Correctness:
+
+- `tests/test_mega_moe_sm90.py --num-processes 8 --layers 1 2 3 4 --fail-fast`
+- Result: `PASSED all 32 scenarios`, all `diff=0.0000`.
+
+Final default sweep:
+
+- Log: `work/codex-pr360/profiles/final-default-20260623-022818.log`
+- Command: default auto path, `--batches 1 2 4 8 16 32 64 128 256 512 1024 --num-tests 9`.
+
+| tokens | PR360 us | final us | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 148.7 | 148.4 | 0.20% |
+| 2 | 216.2 | 216.0 | 0.09% |
+| 4 | 308.1 | 306.3 | 0.59% |
+| 8 | 372.2 | 367.5 | 1.28% |
+| 16 | 397.3 | 388.0 | 2.40% |
+| 32 | 402.5 | 396.3 | 1.56% |
+| 64 | 408.2 | 402.1 | 1.52% |
+| 128 | 417.6 | 407.2 | 2.55% |
+| 256 | 555.7 | 555.5 | 0.04% |
+| 512 | 816.9 | 816.7 | 0.02% |
+| 1024 | 1310.0 | 1267.7 | 3.34% |
+
+What to learn from this:
+
+- Optimization 1 helps the small/medium pingpong band: `8-128` tokens.
+- Optimization 2 helps the large cooperative point: `1024` tokens.
+- `256/512` did not move; that is useful information. The next real work should target cooperative internals, not more host thresholds.
+
+## Long-sequence Exploration Start
+
+Why `4096` is not enough:
+
+- For this MegaMoE shape, `4096` is only a transition point. It can show cooperative behavior, but not enough to expose true long-sequence scaling.
+- Long sequence should test whether the kernel becomes compute-bound, HBM/weight-traffic-bound, or scheduler/arrival-mask-bound when each expert has many M blocks.
+
+Plan:
+
+- Probe `8192 / 16384 / 32768 / 65536` tokens first.
+- Do not start with `131072`: the symmetric buffer alone is too close to full-card memory.
+- Use low repeat count first to find stable capacity, then repeat interesting points.
+
+Symmetric buffer size from `_C.get_symm_buffer_size_for_mega_moe`, default H200/L20X shape:
+
+| tokens | symm buffer GiB | take |
+| ---: | ---: | --- |
+| 8192 | 8.34 | safe |
+| 16384 | 16.59 | safe |
+| 32768 | 33.10 | safe |
+| 65536 | 66.11 | likely safe with 143 GiB free |
+| 131072 | 132.14 | too close; skip until needed |
+
+Teaching point:
+
+- Before profiling long sequence, first check memory formula. Otherwise an OOM tells you nothing about performance.
+- Here `65536` is the practical first upper point; `131072` would mix kernel behavior with memory pressure.
+
+### Long-sequence Correction: One Length Per Process
+
+Mistake:
+
+```bash
+python3 tests/bench_mega_moe_sm90.py \
+  --batches 8192 16384 32768 65536 --num-tests 3
+```
+
+Result:
+
+- `8192` ran: `8626.0 us`, `665.3 TFLOPS`.
+- Then the process hit CUDA OOM while moving to the next length.
+
+Why:
+
+- The benchmark sets `num_max_tokens_per_rank = max(batches)`.
+- So even the `8192` case allocated the `65536` symmetric buffer.
+- In the same spawned process, allocator/symmetric-memory cleanup did not return enough memory before the next config allocation.
+
+Fix:
+
+- Run each long length in a separate Python process.
+- This is also cleaner: `num_max_tokens_per_rank` then matches the tested length.
+
+Teaching point:
+
+- For long sequence, benchmark harness behavior matters. If capacity is wrong, OOM is not a kernel result.
+
+### Long-sequence Baseline: Single Process Per Length
+
+Command log:
+
+- `work/codex-pr360/profiles/longseq-single-20260623-024054.log`
+
+Command shape:
+
+```bash
+for b in 8192 16384 32768 65536; do
+  python3 tests/bench_mega_moe_sm90.py     --num-processes 8 --batches $b --num-tests 3
+done
+```
+
+Result:
+
+| tokens | recv | time us | TFLOPS | model GB/s | compute lb us | headroom |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 65155 | 8538.0 | 672.2 | 360 | 2900.1 | 2.94x |
+| 16384 | 130971 | 17474.3 | 660.2 | 273 | 5829.5 | 3.00x |
+| 32768 | 262357 | 35621.3 | 648.7 | 228 | 11676.4 | 3.05x |
+| 65536 | 524339 | 74363.2 | 621.1 | 199 | 23338.5 | 3.19x |
+
+Lesson:
+
+- Runtime scales roughly linearly with token count, but throughput gets worse: `672 TFLOPS` at 8k drops to `621 TFLOPS` at 64k.
+- The simple model GB/s also drops, so the benchmark byte model is missing real traffic or stalls.
+- A likely reason is repeated weight tile loading and scheduler order: long sequence has many M blocks per expert, so block order decides whether weight tiles are reused or reloaded.
+
+Next test:
+
+- Toggle L2 N-major scheduling on long sequence.
+- If N-major matters, then block order / weight reuse is a real long-sequence lever, and L1 scheduling becomes a reasonable feature candidate.
+
+### Why Pingpong Is Slower on Long Sequence
+
+Data:
+
+| tokens | pingpong us | cooperative us | cooperative faster |
+| ---: | ---: | ---: | ---: |
+| 8192 | 9852.1 | 8752.8 | 12.6% |
+| 32768 | 40291.9 | 35451.5 | 13.7% |
+
+Why I think this happens:
+
+1. `BLOCK_M` is smaller in pingpong.
+   - Pingpong uses `BLOCK_M=64`.
+   - Cooperative uses `BLOCK_M=128` by splitting one tile across two math warpgroups.
+   - For long sequence, each expert has many M blocks, so pingpong creates about 2x as many M tiles.
+
+2. Cooperative shares the B/weight tile across two warpgroups.
+   - In cooperative, two WGs work on the same `(expert, m128, n128)` tile, each owning 64 rows.
+   - The B tile is loaded once and consumed by both WGs.
+   - In pingpong, the two WGs work on different `m64` tiles, so the same B tile is effectively loaded for each M slice.
+   - Long sequence has many M slices, so this repeated weight traffic becomes expensive.
+
+3. More tiles also means more scheduler/epilogue/arrival work.
+   - More L1 tiles: more SwiGLU + FP8 stores + L2 arrival-mask updates.
+   - More L2 tiles: more BF16 scatter work and tile-boundary synchronization.
+   - Combine is mostly the same for both kernels, so the slowdown is likely before combine.
+
+Concrete scale example at 32768 tokens:
+
+- Rank0 received `262357` routed rows, about `8199` rows per local expert.
+- M blocks per expert:
+  - pingpong: `ceil(8199 / 64) = 129`
+  - cooperative: `ceil(8199 / 128) = 65`
+- N blocks per expert: `32` for L1 and `56` for L2.
+- Rough tile count per expert:
+  - pingpong: `129 * (32 + 56) = 11352`
+  - cooperative: `65 * (32 + 56) = 5720`
+
+Lesson:
+
+- Pingpong is a latency/overlap design: good when there are not many M blocks and epilogue overlap matters.
+- Long sequence is a throughput/reuse problem: cooperative wins because it reduces tile count and reuses B/weight tiles better.
+- So for long sequence, optimizing pingpong is probably the wrong target. The useful target is cooperative: reduce per-tile overhead, improve weight reuse, or reduce combine/scatter cost.
+
+### Correction: Does PR360 Use Pingpong for Long Sequence?
+
+Important correction:
+
+- PR360 default auto routing does **not** use pingpong for long sequence.
+- The default threshold is `256` tokens:
+  - `<256`: pingpong
+  - `>=256`: cooperative
+
+So the right conclusion is:
+
+- Pingpong has a real scalability weakness for long sequence.
+- But PR360 mostly avoids that weakness through the cooperative threshold.
+- If someone forces pingpong, or if the threshold is moved too high, long-sequence performance drops about `12%-14%` in my tests.
+
+Better wording for the PR360 critique:
+
+- Not: "PR360 uses pingpong for long sequence."
+- Yes: "PR360's pingpong design is not suitable for long sequence; the long-sequence path must stay cooperative, and further optimization should target cooperative internals."
+
+This matters because a wrong diagnosis would push us to optimize the wrong kernel.
+
+## Optimization Scope Going Forward
+
+User intent:
+
+- The target is not just to run PR360 or tune a few thresholds.
+- The target is to make the SM90 MegaMoE kernel better than PR360 where possible.
+- Long sequence is the hard case and should be treated as a main optimization target.
+
+Directions to actively consider:
+
+1. Length-specific strategy.
+   - Small/medium tokens and long tokens should not be forced into one heuristic story.
+   - Long sequence needs its own cooperative-path analysis.
+
+2. Cooperative kernel internals.
+   - Scheduler order, per-tile overhead, L1/L2 epilogue, scatter, and combine need phase evidence.
+   - Do not optimize pingpong for long sequence unless data contradicts the current result.
+
+3. Quantization / scale representation.
+   - Current SM90 path uses FP8 e4m3 with float scale factors.
+   - Potential experiments: different scale granularity, cheaper scale path, or reducing scale traffic.
+   - Any quantization change must pass correctness first, then A/B perf.
+
+4. Failed ideas are still useful.
+   - If an idea does not improve performance, record which bottleneck guess was wrong.
+
+Rule:
+
+- Prefer feature experiments that test a bottleneck hypothesis over small parameter sweeps.
+
