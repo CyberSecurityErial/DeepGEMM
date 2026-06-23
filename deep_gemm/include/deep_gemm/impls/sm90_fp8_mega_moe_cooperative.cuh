@@ -67,6 +67,9 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kL2NMajorSchedule,
+    bool kPhaseProfile,
+    bool kFuseTopkWeight,
+    bool kFastRankSelect,
     uint32_t L1_SHAPE_N              = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K              = kHidden,
     uint32_t L2_SHAPE_N              = kHidden,
@@ -115,6 +118,19 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
+
+    constexpr uint32_t kNumProfileMetrics = 8;
+    auto profile_store = [&](uint32_t metric_idx, uint64_t cycles, uint64_t count, uint64_t max_cycles) {
+        if constexpr (kPhaseProfile) {
+            if (cumulative_local_expert_recv_stats != nullptr) {
+                auto* profile = reinterpret_cast<unsigned long long*>(
+                    cumulative_local_expert_recv_stats + kNumExpertsPerRank);
+                profile[metric_idx] = static_cast<unsigned long long>(cycles);
+                profile[kNumProfileMetrics + metric_idx] = static_cast<unsigned long long>(max_cycles);
+                profile[2 * kNumProfileMetrics + metric_idx] = static_cast<unsigned long long>(count);
+            }
+        }
+    };
 
     // Prefetch all TMA descriptors at the very beginning
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -374,6 +390,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     if (warp_idx < kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
+        uint64_t profile_dispatch_start = 0, profile_pull_start = 0;
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and thread_idx == 0)
+                profile_dispatch_start = clock64();
+        }
+
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx             = [&](const auto& process) {
@@ -455,12 +477,18 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         const auto pull_mbarrier     = dispatch_barriers[warp_idx];
 
         scheduler.fetch_expert_recv_count();
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and thread_idx == 0)
+                profile_pull_start = clock64();
+        }
 
         constexpr uint32_t kNumRanksPerLane          = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx                       = -1;
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
+        uint32_t fast_rank_mask = 0, fast_rank_count = 0;
+        uint32_t fast_rank_len = 0, fast_rank_tokens = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;; token_idx += kNumGlobalWarps) {
@@ -482,51 +510,77 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t j     = i * 32 + lane_idx;
                     stored_rank_count[i] = j < kNumRanks ? static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
                 }
+                if constexpr (kFastRankSelect and kNumRanksPerLane == 1) {
+                    const bool active = stored_rank_count[0] > 0;
+                    fast_rank_mask = __ballot_sync(0xffffffff, active);
+                    fast_rank_count = __popc(fast_rank_mask);
+                    const uint32_t lane_min = active ? stored_rank_count[0] : 0xffffffffu;
+                    fast_rank_len = fast_rank_count > 0 ? __reduce_min_sync(0xffffffff, lane_min) : 0;
+                    fast_rank_tokens = fast_rank_len * fast_rank_count;
+                }
             }
 
-            // Round-robin rank selection (identical to SM100)
-            uint32_t current_rank_in_expert_idx;
-            uint32_t remaining[kNumRanksPerLane];
-#pragma unroll
-            for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
-                remaining[i] = stored_rank_count[i];
-            uint32_t offset              = 0;
+            // Round-robin rank selection. The fast path handles the common first
+            // round for kNumRanks <= 32; the tail falls back to the original logic.
+            uint32_t current_rank_in_expert_idx = 0;
+            uint32_t token_idx_in_rank = 0;
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-            uint32_t slot_idx            = token_idx_in_expert;
-            uint32_t token_idx_in_rank;
-            while (true) {
-                uint32_t num_actives_in_lane = 0;
-                uint32_t min_in_lane         = 0xffffffff;
-#pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
-                    num_actives_in_lane += remaining[i] > 0;
-                    if (remaining[i] > 0)
-                        min_in_lane = cute::min(min_in_lane, remaining[i]);
+            uint32_t slot_idx = token_idx_in_expert;
+            bool rank_selected = false;
+            if constexpr (kFastRankSelect and kNumRanksPerLane == 1) {
+                if (slot_idx < fast_rank_tokens) {
+                    const uint32_t slot_idx_in_round = slot_idx % fast_rank_count;
+                    current_rank_in_expert_idx = __fns(fast_rank_mask, 0, slot_idx_in_round + 1);
+                    token_idx_in_rank = slot_idx / fast_rank_count;
+                    rank_selected = true;
                 }
-                const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-                const uint32_t length           = __reduce_min_sync(0xffffffff, min_in_lane);
-
-                const uint32_t num_round_tokens = length * num_active_ranks;
-                if (slot_idx < num_round_tokens) {
-                    const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-                    uint32_t num_seen_ranks          = 0;
-                    current_rank_in_expert_idx       = 0;
-#pragma unroll
-                    for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
-                        const uint32_t mask             = __ballot_sync(0xffffffff, remaining[i] > 0);
-                        const uint32_t num_active_lanes = __popc(mask);
-                        if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
-                            current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-                        num_seen_ranks += num_active_lanes;
-                    }
-                    token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-                    break;
-                }
-                slot_idx -= num_round_tokens;
-                offset   += length;
+            }
+            if (not rank_selected) {
+                uint32_t remaining[kNumRanksPerLane];
 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
-                    remaining[i] -= cute::min(remaining[i], length);
+                    remaining[i] = stored_rank_count[i];
+                uint32_t offset = 0;
+                if constexpr (kFastRankSelect and kNumRanksPerLane == 1) {
+                    if (fast_rank_tokens > 0) {
+                        slot_idx -= fast_rank_tokens;
+                        offset = fast_rank_len;
+                        remaining[0] -= cute::min(remaining[0], fast_rank_len);
+                    }
+                }
+                while (true) {
+                    uint32_t num_actives_in_lane = 0;
+                    uint32_t min_in_lane         = 0xffffffff;
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
+                        num_actives_in_lane += remaining[i] > 0;
+                        if (remaining[i] > 0)
+                            min_in_lane = cute::min(min_in_lane, remaining[i]);
+                    }
+                    const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
+                    const uint32_t length           = __reduce_min_sync(0xffffffff, min_in_lane);
+
+                    const uint32_t num_round_tokens = length * num_active_ranks;
+                    if (slot_idx < num_round_tokens) {
+                        const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
+                        uint32_t num_seen_ranks          = 0;
+#pragma unroll
+                        for (uint32_t i = 0; i < kNumRanksPerLane; ++i) {
+                            const uint32_t mask             = __ballot_sync(0xffffffff, remaining[i] > 0);
+                            const uint32_t num_active_lanes = __popc(mask);
+                            if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                                current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                            num_seen_ranks += num_active_lanes;
+                        }
+                        token_idx_in_rank = offset + (slot_idx / num_active_ranks);
+                        break;
+                    }
+                    slot_idx -= num_round_tokens;
+                    offset   += length;
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
+                        remaining[i] -= cute::min(remaining[i], length);
+                }
             }
 
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
@@ -583,6 +637,13 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
             }
             __syncwarp();
+        }
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and thread_idx == 0) {
+                const auto now = clock64();
+                profile_store(0, now - profile_dispatch_start, 1, now - profile_dispatch_start);
+                profile_store(1, now - profile_pull_start, 1, now - profile_pull_start);
+            }
         }
 
         // Cleanup workspace, overlapping with combine
@@ -795,6 +856,15 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        uint64_t profile_math_start = 0, profile_barrier_start = 0, profile_combine_start = 0;
+        uint64_t profile_l1_tile_cycles = 0, profile_l2_tile_cycles = 0;
+        uint64_t profile_l1_tile_max = 0, profile_l2_tile_max = 0;
+        uint64_t profile_l1_tile_count = 0, profile_l2_tile_count = 0;
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and epilogue_thread_idx == 0)
+                profile_math_start = clock64();
+        }
+
         // Manually inlined scheduler loop — CRITICAL: avoids lambda outlining
         // that causes ptxas C7510 "wgmma.mma_async serialized due to function
         // call boundary" warnings, which serialise the WGMMA pipeline.
@@ -815,6 +885,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx          = pool_block_idx * BLOCK_M;
             const uint32_t n_idx          = n_block_idx * BLOCK_N;
+
+            uint64_t profile_tile_start = 0;
+            if constexpr (kPhaseProfile) {
+                if (sm_idx == 0 and epilogue_thread_idx == 0)
+                    profile_tile_start = clock64();
+            }
 
             // ---------------- GEMM (MMA region; 2 WGs cooperate on this tile) ----------------
             using WGMMA                        = L1WGMMA;
@@ -1032,10 +1108,21 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 float swiglu_r0[kNumPairs][2];
                 float swiglu_r1[kNumPairs][2];
 
-                // Per-row amax across all 8 pairs
+                float weight_r0 = 0.0f, weight_r1 = 0.0f;
+                if constexpr (kFuseTopkWeight) {
+                    weight_r0 = *l1_topk_weights_buffer
+                                     .get_data_buffer(m_idx + row_block_offset + r_0)
+                                     .get_base_ptr<float>();
+                    weight_r1 = *l1_topk_weights_buffer
+                                     .get_data_buffer(m_idx + row_block_offset + r_1)
+                                     .get_base_ptr<float>();
+                }
+
+                // Per-row amax across all 8 pairs.
                 float amax_r0 = 0.0f, amax_r1 = 0.0f;
 
-// Compute SwiGLU + per-pair amax
+// Compute SwiGLU + per-pair amax. When enabled, topk weight is fused here to
+// remove the old second pass over the stored SwiGLU values.
 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++p) {
                     const uint32_t gate = 2 * p, up = 2 * p + 1;
@@ -1076,32 +1163,43 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                         return x * sig;
                     };
 
-                    swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                    swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
-                    swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                    swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                    const float sw_r0_c0 = silu(g_r0_c0) * u_r0_c0;
+                    const float sw_r0_c1 = silu(g_r0_c1) * u_r0_c1;
+                    const float sw_r1_c0 = silu(g_r1_c0) * u_r1_c0;
+                    const float sw_r1_c1 = silu(g_r1_c1) * u_r1_c1;
+                    if constexpr (kFuseTopkWeight) {
+                        swiglu_r0[p][0] = sw_r0_c0 * weight_r0;
+                        swiglu_r0[p][1] = sw_r0_c1 * weight_r0;
+                        swiglu_r1[p][0] = sw_r1_c0 * weight_r1;
+                        swiglu_r1[p][1] = sw_r1_c1 * weight_r1;
+                    } else {
+                        swiglu_r0[p][0] = sw_r0_c0;
+                        swiglu_r0[p][1] = sw_r0_c1;
+                        swiglu_r1[p][0] = sw_r1_c0;
+                        swiglu_r1[p][1] = sw_r1_c1;
+                    }
 
                     amax_r0 = cute::max(amax_r0, cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
                     amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
                 }
 
-                // Apply token weight: SwiGLU * topk_weight (single load per row).
-                // COOP: this WG's rows are m_idx + row_block_offset + r_*.
-                float weight_r0 = *l1_topk_weights_buffer
-                                       .get_data_buffer(m_idx + row_block_offset + r_0)
-                                       .get_base_ptr<float>();
-                float weight_r1 = *l1_topk_weights_buffer
-                                       .get_data_buffer(m_idx + row_block_offset + r_1)
-                                       .get_base_ptr<float>();
+                if constexpr (!kFuseTopkWeight) {
+                    weight_r0 = *l1_topk_weights_buffer
+                                     .get_data_buffer(m_idx + row_block_offset + r_0)
+                                     .get_base_ptr<float>();
+                    weight_r1 = *l1_topk_weights_buffer
+                                     .get_data_buffer(m_idx + row_block_offset + r_1)
+                                     .get_base_ptr<float>();
 #pragma unroll
-                for (uint32_t p = 0; p < kNumPairs; ++p) {
-                    swiglu_r0[p][0] *= weight_r0;
-                    swiglu_r0[p][1] *= weight_r0;
-                    swiglu_r1[p][0] *= weight_r1;
-                    swiglu_r1[p][1] *= weight_r1;
+                    for (uint32_t p = 0; p < kNumPairs; ++p) {
+                        swiglu_r0[p][0] *= weight_r0;
+                        swiglu_r0[p][1] *= weight_r0;
+                        swiglu_r1[p][0] *= weight_r1;
+                        swiglu_r1[p][1] *= weight_r1;
+                    }
+                    amax_r0 *= cute::abs(weight_r0);
+                    amax_r1 *= cute::abs(weight_r1);
                 }
-                amax_r0 *= cute::abs(weight_r0);
-                amax_r1 *= cute::abs(weight_r1);
 
                 // Reduce amax across the 4 col-lanes that share the same row.
                 // In WGMMA m64n128k32 output, the 4 lanes (`lane_idx & 3` differs,
@@ -1288,7 +1386,33 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 // (kNumEpilogueThreads) is consistent and cannot deadlock.
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
+            if constexpr (kPhaseProfile) {
+                if (sm_idx == 0 and epilogue_thread_idx == 0) {
+                    const uint64_t tile_cycles = clock64() - profile_tile_start;
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        profile_l1_tile_cycles += tile_cycles;
+                        profile_l1_tile_count += 1;
+                        if (tile_cycles > profile_l1_tile_max)
+                            profile_l1_tile_max = tile_cycles;
+                    } else {
+                        profile_l2_tile_cycles += tile_cycles;
+                        profile_l2_tile_count += 1;
+                        if (tile_cycles > profile_l2_tile_max)
+                            profile_l2_tile_max = tile_cycles;
+                    }
+                }
+            }
             ++pos;
+        }
+
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and epilogue_thread_idx == 0) {
+                const auto now = clock64();
+                profile_store(2, now - profile_math_start, 1, now - profile_math_start);
+                profile_store(5, profile_l1_tile_cycles, profile_l1_tile_count, profile_l1_tile_max);
+                profile_store(6, profile_l2_tile_cycles, profile_l2_tile_count, profile_l2_tile_max);
+                profile_barrier_start = now;
+            }
         }
 
         // ---------------- COMBINE ----------------
@@ -1304,6 +1428,13 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
         // dispatch may now safely clean workspace state.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and epilogue_thread_idx == 0) {
+                const auto now = clock64();
+                profile_store(3, now - profile_barrier_start, 1, now - profile_barrier_start);
+                profile_combine_start = now;
+            }
+        }
 
 
         constexpr uint32_t kNumHiddenBytes   = kHidden * sizeof(nv_bfloat16);
@@ -1410,6 +1541,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+            }
+        }
+        if constexpr (kPhaseProfile) {
+            if (sm_idx == 0 and epilogue_thread_idx == 0) {
+                const auto now = clock64();
+                profile_store(4, now - profile_combine_start, 1, now - profile_combine_start);
             }
         }
     }

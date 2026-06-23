@@ -43,6 +43,9 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool phase_profile;
+        bool fuse_topk_weight;
+        bool fast_rank_select;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -75,6 +78,9 @@ public:
 // cooperative_v3: L2-acts SF uses true-float scale (sf = amax/448) instead of
 //   UE8M0 power-of-2 alignment (no storage saving on Hopper; matches reference).
 //   v3: sf_inv = rcp(sf) (one mul fewer per row than kE4M3Max*rcp(amax)).
+// cooperative_v4: optional coarse phase profiling behind DG_SM90_MOE_PHASE_PROFILE.
+// cooperative_v5: optional L1 topk-weight fusion behind DG_SM90_MOE_FUSE_TOPK_WEIGHT.
+// cooperative_v6: fast rank select for kNumRanks <= 32 behind DG_SM90_MOE_FAST_RANK_SELECT.
 // Eliminate all vprintf calls that cause ptxas C7510 (WGMMA pipeline
 // serialization due to function call boundary):
 // 1. DG_DEVICE_ASSERT → trap-only (no printf)
@@ -98,7 +104,10 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {},
+        {},
+        {},
+        {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -113,7 +122,10 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.config.l2_nmajor_schedule ? "true" : "false");
+    args.config.l2_nmajor_schedule ? "true" : "false",
+    args.phase_profile ? "true" : "false",
+    args.fuse_topk_weight ? "true" : "false",
+    args.fast_rank_select ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -223,6 +235,9 @@ static void sm90_fp8_mega_moe_cooperative(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0 and cumulative_local_expert_recv_stats_ptr != nullptr,
+        .fuse_topk_weight = get_env<int>("DG_SM90_MOE_FUSE_TOPK_WEIGHT", 0) != 0,
+        .fast_rank_select = get_env<int>("DG_SM90_MOE_FAST_RANK_SELECT", 1) != 0,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

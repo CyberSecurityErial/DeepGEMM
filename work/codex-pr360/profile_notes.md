@@ -879,3 +879,86 @@ Rule:
 
 - Prefer feature experiments that test a bottleneck hypothesis over small parameter sweeps.
 
+### Phase Profiling: Coarse Then Tile-Level
+
+I first made a mistake while testing the new phase profiler: running the main repo's `tests/bench_mega_moe_sm90.py` imported the source `deep_gemm/` package instead of the isolated installed wheel, so `_C.so` was missing. The fix was to run the isolated script under `work/codex-pr360/src/tests/...`, whose `_C.so` points to `work/codex-pr360/site`.
+
+Coarse phase data said the long path is not combine-bound:
+
+| tokens | dispatch_pull cycles | math_loop cycles | combine_reduce cycles |
+| ---: | ---: | ---: | ---: |
+| 8192 | 2.91M | 12.30M | 0.54M |
+| 32768 | 10.98M | 48.02M | 1.78M |
+
+Then I split `math_loop` into representative L1/L2 tile timing:
+
+| tokens | L1 tiles | L1 avg cycles | L2 tiles | L2 avg cycles |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 128 | 55.9k | 222 | 21.6k |
+| 32768 | 501 | 55.4k | 876 | 21.9k |
+
+Lesson: L1 is heavier per tile because it has the long `K=7168` GEMM plus SwiGLU/FP8 quant. Dispatch pull is still large enough to optimize, especially for long sequence.
+
+### Failed Feature: Fuse Topk Weight Into L1 SwiGLU
+
+Hypothesis: L1 epilogue computes `silu(g) * u`, stores it, then runs a second loop to multiply topk weight. I tried fusing the weight into the first SwiGLU loop to remove that second pass.
+
+A/B result:
+
+| tokens | old us | fused us | result |
+| ---: | ---: | ---: | ---: |
+| 8192 | 8585.6 | 8665.5 | -0.93% |
+| 32768 | 35417.5 | 35422.2 | ~0.00% |
+
+Phase check at 8192 showed why: L1 tile avg went from `55.7k` to `56.5k` cycles. The removed multiply loop was not the bottleneck; moving weight earlier added pressure in the hot epilogue path. I left this behind an env switch, default off: `DG_SM90_MOE_FUSE_TOPK_WEIGHT=0`.
+
+### Winning Feature: Fast Rank Select In Dispatch Pull
+
+Hypothesis: dispatch pull spends time mapping each received token back to `(source rank, token index)` with the full round-robin algorithm. For `kNumRanks <= 32`, most tokens are in the first balanced round of each expert. So I precompute per-expert active-rank mask, active count, and first-round length, then select rank in O(1) for that common case. Tail tokens still use the original algorithm, so the mapping is exact.
+
+A/B result:
+
+| tokens | old us | fast_rank us | improvement |
+| ---: | ---: | ---: | ---: |
+| 8192 | 8730.9 | 8584.6 | +1.70% |
+| 32768 | 35478.0 | 34964.9 | +1.47% |
+| 65536 | 74780.0 | 73683.8 | +1.49% |
+
+Short/medium sweep sanity:
+
+| tokens | old us | fast_rank us | note |
+| ---: | ---: | ---: | --- |
+| 256 | 557.3 | 548.8 | +1.55%, cooperative path |
+| 512 | 818.7 | 810.4 | +1.02%, cooperative path |
+| 1024 | 1265.6 | 1248.9 | +1.34%, cooperative path |
+
+For `<256` tokens, auto uses pingpong, so the small differences there are measurement noise, not this feature.
+
+One caution: the phase profiler is useful for finding large bottlenecks, but a single phase-profile run did not reliably show `dispatch_pull` getting smaller for this feature. I treat the repeated end-to-end A/B above as the stronger evidence here.
+
+Correctness:
+
+- `tests/test_mega_moe_sm90.py --num-processes 8 --layers 1 2 3 4 --fail-fast --num-tests 1`
+- Passed all 32 scenarios, all reported `diff=0.0000`.
+
+### Rough Theory Limit Check
+
+This is a teaching estimate, not a precise hardware proof. I used two simple lower bounds:
+
+1. Compute lower bound: FP8 work divided by H200/L20X-class dense FP8 peak.
+2. HBM lower bound: the benchmark's simple byte model divided by about `4.8 TB/s` HBM bandwidth.
+
+The stricter one is compute in all long cases:
+
+| tokens | measured fast_rank us | compute lb us | HBM-model lb us | stricter lb | headroom |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 8584.6 | 2900.1 | ~641 | compute | 2.96x |
+| 32768 | 34964.9 | 11676.4 | ~1695 | compute | 2.99x |
+| 65536 | 73683.8 | 23338.5 | ~3093 | compute | 3.16x |
+
+Interpretation:
+
+- The simple HBM byte model is not the tightest limit.
+- The gap to compute lower bound is still about `3x`, so the missing performance is likely from scheduling, synchronization, cross-rank movement, TMA/epilogue overhead, and imperfect tensor-core occupancy.
+- The fast-rank feature helps because it removes work from dispatch, but the larger remaining target is still cooperative math-loop efficiency.
+
