@@ -811,7 +811,8 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
             torch.cuda.synchronize()
             names = [
                 'dispatch_total', 'dispatch_pull', 'math_loop', 'combine_barrier',
-                'combine_reduce', 'l1_tile_loop', 'l2_tile_loop', 'unused',
+                'combine_reduce', 'l1_tile_loop', 'l2_tile_loop', 'l1_epilogue',
+                'l2_epilogue', 'unused',
             ]
             num_profile_metrics = len(names)
             profile = cum_stats[

@@ -50,6 +50,10 @@ struct MegaMoESM90Config {
     // sweeping m) — enabled at large tokens-per-expert to cut weight L2 thrash.
     bool l2_nmajor_schedule;
 
+    // Experimental L1 N-major scheduling. This trades input activation reuse for
+    // potential L1 weight reuse and is controlled separately from L2.
+    bool l1_nmajor_schedule;
+
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -65,6 +69,7 @@ struct MegaMoESM90Config {
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
            << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", l2_nmajor_schedule=" << config.l2_nmajor_schedule
+           << ", l1_nmajor_schedule=" << config.l1_nmajor_schedule
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -224,6 +229,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const bool l2_nmajor_schedule = nmajor_override < 0
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
+    const bool l1_nmajor_schedule = false;
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
@@ -237,7 +243,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule,
+        l2_nmajor_schedule, l1_nmajor_schedule,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
@@ -304,6 +310,9 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const bool l2_nmajor_schedule = nmajor_override < 0
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
+    // DIAGNOSTIC: DG_SM90_MOE_L1_NMAJOR overrides the experimental L1 order (-1=auto/off, 0=off, 1=on).
+    const int l1_nmajor_override = get_env<int>("DG_SM90_MOE_L1_NMAJOR", -1);
+    const bool l1_nmajor_schedule = l1_nmajor_override > 0;
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
@@ -317,7 +326,7 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule,
+        l2_nmajor_schedule, l1_nmajor_schedule,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };

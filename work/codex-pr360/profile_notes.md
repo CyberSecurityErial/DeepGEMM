@@ -962,3 +962,80 @@ Interpretation:
 - The gap to compute lower bound is still about `3x`, so the missing performance is likely from scheduling, synchronization, cross-rank movement, TMA/epilogue overhead, and imperfect tensor-core occupancy.
 - The fast-rank feature helps because it removes work from dispatch, but the larger remaining target is still cooperative math-loop efficiency.
 
+
+
+### Phase Split: Epilogue Is Not The Main Long-Sequence L1 Bottleneck
+
+I split the tile profiler one level further: `l1_tile_loop/l2_tile_loop` now include the whole tile, and `l1_epilogue/l2_epilogue` isolate the post-WGMMA epilogue part.
+
+| tokens | L1 tile avg | L1 epilogue avg | L2 tile avg | L2 epilogue avg |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 55.6k | 3.4k | 21.7k | 4.9k |
+| 32768 | 55.7k | 3.6k | 22.3k | 5.4k |
+
+What this teaches me:
+
+- L1 epilogue is only about `6-7%` of an L1 tile. So the failed topk-weight fusion makes sense: I was optimizing a small tail and added pressure to a hot path.
+- L2 epilogue is a bigger fraction of L2 tile, around `23-24%`, but L2 tiles are much cheaper than L1 tiles overall.
+- For long sequence, the bigger target is still L1 mainloop/scheduling/imbalance, not just the activation/quant epilogue.
+
+### Failed Feature: L1 N-Major Scheduling
+
+Hypothesis: L1 has very large `K=7168`, and the L1 weight tile is reused across many token blocks. I added an experimental scheduler path `DG_SM90_MOE_L1_NMAJOR=1` that sweeps M for the same L1 N block, similar in spirit to the existing L2 N-major path. The default remains off.
+
+A/B result with fast-rank on and topk fusion off:
+
+| tokens | L1 M-major us | L1 N-major us | result |
+| ---: | ---: | ---: | ---: |
+| 8192 | 8461.4 | 8428.7 | +0.39% |
+| 32768 | 35762.6 | 37765.3 | -5.60% |
+
+The first guess was wrong for the important long case. Phase profile at `32768` showed why:
+
+| mode | time us | math_loop | combine_barrier | L1 tile avg | L2 tile avg |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| L1 M-major | 34449.3 | 48.42M | 0.16M | 55.7k | 22.0k |
+| L1 N-major | 37475.1 | 48.32M | 5.08M | 55.8k | 21.9k |
+
+The single-tile cost did not meaningfully change. The slowdown appeared as a much larger wait before combine. My read: L1 N-major changes the global completion shape and makes long-sequence work finish less evenly across ranks/SMs. So this is not a keeper as an automatic long-sequence policy. It stays as a diagnostic switch only.
+
+
+### Failed Feature: Direct L2 Scatter From Registers
+
+Hypothesis: L2 epilogue first packs BF16 into `smem_cd_l2`, syncs, then reads `uint4` back for NVLink scatter. Since phase profiling showed L2 epilogue is about `5k cycles` per tile, I tried a temporary local switch, `DG_SM90_MOE_DIRECT_L2_SCATTER=1`: use warp shuffles to gather the four WGMMA col-lanes for each row and scatter `uint4` directly from registers. This removes the shared-memory staging path and its cross-WG hazard barrier.
+
+Correctness smoke passed (`diff=0.0000`), but performance was much worse:
+
+| tokens | default us | direct scatter us | result |
+| ---: | ---: | ---: | ---: |
+| 8192 | 8438.3 | 10423.9 | -23.5% |
+| 32768 | 35496.4 | 42039.6 | -18.4% |
+
+Phase profile at `32768` explains it:
+
+| mode | time us | math_loop | L2 tile avg | L2 epilogue avg | combine_barrier |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default SMEM staging | 34624.4 | 48.01M | 21.7k | 5.1k | 1.85M |
+| direct register scatter | 42085.0 | 65.29M | 37.0k | 18.3k | 2.12M |
+
+The idea failed because the SMEM path is not just a useless detour. It cheaply rearranges WGMMA's per-lane register layout into contiguous `uint4` chunks, then lets many lanes issue simple vector writes. My direct path paid many shuffle instructions and reduced useful scatter parallelism. Lesson: if I want to improve L2 scatter, I need a better layout-aware scatter pattern, not simply bypass SMEM.
+
+
+### Default Path Check After Failed Experiments
+
+After adding the diagnostic switches above, I rechecked the normal path with both failed features off:
+
+- `DG_SM90_MOE_L1_NMAJOR=0`
+- `DG_SM90_MOE_FAST_RANK_SELECT=1`
+- `DG_SM90_MOE_FUSE_TOPK_WEIGHT=0`
+
+Correctness: all 32 scenarios passed, all `diff=0.0000`.
+
+Sanity benchmark:
+
+| tokens | time us | TFLOPS |
+| ---: | ---: | ---: |
+| 8192 | 8525.4 | 673.1 |
+| 32768 | 35647.1 | 648.0 |
+
+This is within the normal run-to-run band of the fast-rank default path. The failed L1 N-major experiment is not enabled by default; the direct-scatter code was not kept after profiling showed it was clearly worse.

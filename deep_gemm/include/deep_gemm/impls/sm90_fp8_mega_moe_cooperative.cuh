@@ -67,6 +67,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kL2NMajorSchedule,
+    bool kL1NMajorSchedule,
     bool kPhaseProfile,
     bool kFuseTopkWeight,
     bool kFastRankSelect,
@@ -119,7 +120,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
 
-    constexpr uint32_t kNumProfileMetrics = 8;
+    constexpr uint32_t kNumProfileMetrics = 10;
     auto profile_store = [&](uint32_t metric_idx, uint64_t cycles, uint64_t count, uint64_t max_cycles) {
         if constexpr (kPhaseProfile) {
             if (cumulative_local_expert_recv_stats != nullptr) {
@@ -333,7 +334,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule>(workspace);
+        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule, kL1NMajorSchedule>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -860,6 +861,9 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         uint64_t profile_l1_tile_cycles = 0, profile_l2_tile_cycles = 0;
         uint64_t profile_l1_tile_max = 0, profile_l2_tile_max = 0;
         uint64_t profile_l1_tile_count = 0, profile_l2_tile_count = 0;
+        uint64_t profile_l1_epilogue_cycles = 0, profile_l2_epilogue_cycles = 0;
+        uint64_t profile_l1_epilogue_max = 0, profile_l2_epilogue_max = 0;
+        uint64_t profile_l1_epilogue_count = 0, profile_l2_epilogue_count = 0;
         if constexpr (kPhaseProfile) {
             if (sm_idx == 0 and epilogue_thread_idx == 0)
                 profile_math_start = clock64();
@@ -886,7 +890,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             const uint32_t m_idx          = pool_block_idx * BLOCK_M;
             const uint32_t n_idx          = n_block_idx * BLOCK_N;
 
-            uint64_t profile_tile_start = 0;
+            uint64_t profile_tile_start = 0, profile_epilogue_start = 0;
             if constexpr (kPhaseProfile) {
                 if (sm_idx == 0 and epilogue_thread_idx == 0)
                     profile_tile_start = clock64();
@@ -1087,6 +1091,11 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                         final_accum[i * 4 + 3] += s1_hi * accum[i * 4 + 3];
                     }
                 }
+            }
+
+            if constexpr (kPhaseProfile) {
+                if (sm_idx == 0 and epilogue_thread_idx == 0)
+                    profile_epilogue_start = clock64();
             }
 
             // COOP: no MMA/epilogue order handoff — both WGs computed their own
@@ -1388,17 +1397,27 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             }
             if constexpr (kPhaseProfile) {
                 if (sm_idx == 0 and epilogue_thread_idx == 0) {
-                    const uint64_t tile_cycles = clock64() - profile_tile_start;
+                    const uint64_t now = clock64();
+                    const uint64_t tile_cycles = now - profile_tile_start;
+                    const uint64_t epilogue_cycles = now - profile_epilogue_start;
                     if (block_phase == sched::BlockPhase::Linear1) {
                         profile_l1_tile_cycles += tile_cycles;
                         profile_l1_tile_count += 1;
                         if (tile_cycles > profile_l1_tile_max)
                             profile_l1_tile_max = tile_cycles;
+                        profile_l1_epilogue_cycles += epilogue_cycles;
+                        profile_l1_epilogue_count += 1;
+                        if (epilogue_cycles > profile_l1_epilogue_max)
+                            profile_l1_epilogue_max = epilogue_cycles;
                     } else {
                         profile_l2_tile_cycles += tile_cycles;
                         profile_l2_tile_count += 1;
                         if (tile_cycles > profile_l2_tile_max)
                             profile_l2_tile_max = tile_cycles;
+                        profile_l2_epilogue_cycles += epilogue_cycles;
+                        profile_l2_epilogue_count += 1;
+                        if (epilogue_cycles > profile_l2_epilogue_max)
+                            profile_l2_epilogue_max = epilogue_cycles;
                     }
                 }
             }
@@ -1411,6 +1430,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 profile_store(2, now - profile_math_start, 1, now - profile_math_start);
                 profile_store(5, profile_l1_tile_cycles, profile_l1_tile_count, profile_l1_tile_max);
                 profile_store(6, profile_l2_tile_cycles, profile_l2_tile_count, profile_l2_tile_max);
+                profile_store(7, profile_l1_epilogue_cycles, profile_l1_epilogue_count, profile_l1_epilogue_max);
+                profile_store(8, profile_l2_epilogue_cycles, profile_l2_epilogue_count, profile_l2_epilogue_max);
                 profile_barrier_start = now;
             }
         }

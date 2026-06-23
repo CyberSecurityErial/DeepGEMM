@@ -24,6 +24,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kClusterSize = 2,
           bool kL2NMajorSchedule = false,
+          bool kL1NMajorSchedule = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -127,9 +128,19 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL1BlockNs;
-            if (m_block_idx < num_m_blocks)
+            if (block_idx < num_m_blocks * kNumL1BlockNs) {
+                // L1 default is M-major to reuse the input activation tile across
+                // all N blocks. The experimental N-major path tests the opposite
+                // tradeoff: keep the larger L1 weight N tile hot while sweeping M.
+                if constexpr (kL1NMajorSchedule) {
+                    n_block_idx = block_idx / num_m_blocks;
+                    m_block_idx = block_idx - n_block_idx * num_m_blocks;
+                } else {
+                    m_block_idx = block_idx / kNumL1BlockNs;
+                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                }
                 return true;
+            }
 
             // Current expert is fully assigned, move to the next
             block_idx -= num_m_blocks * kNumL1BlockNs;
@@ -171,8 +182,8 @@ struct MegaMoEScheduler {
 
             if (next_phase == BlockPhase::Linear1) {
                 if (fetch_next_l1_block()) {
-                    // Found a new L1 block
-                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                    // Found a new L1 block (m_block_idx / n_block_idx already set
+                    // inside fetch_next_l1_block per the selected order)
                     // Jump to next block
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
