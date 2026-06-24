@@ -1408,3 +1408,116 @@ Why this range:
 Baseline note: I did not complete the DeepEP/TileLang unfused baseline table in this pass. The benchmark's `--baseline-version both` path is DeepEP dispatch/combine + TileLang SwiGLU/FP8 + DeepGEMM grouped GEMMs, split into V1 contiguous, V1 low-latency, and V2 ElasticBuffer. I tried a minimal `/tmp` install instead of changing the main environment. TileLang without dependencies needed `apache-tvm-ffi`, `torch-c-dlpack-ext`, `z3-solver`, `cloudpickle`, and `ml-dtypes`; after pinning `z3-solver==4.15.4.0`, importing `tilelang.profiler.bench` with the existing torch env still aborted inside TVM FFI: `TypeAttr __ffi_repr__ is already registered`. DeepEP's PyPI build also requires an older NVSHMEM layout with `libnvshmem.a`, while the installed NVIDIA NVSHMEM wheel provides `libnvshmem_device.a` and `libnvshmem_host.so.3`. The user asked not to make large environment changes, so I stopped there. This does not affect the SFB conclusion above, because the SFB table compares against the current PR360/SOTA fused path with only this feature toggled.
 
 Next useful idea: for longer sequences, SFB is not the right lever once the producer side dominates. The next feature should target larger long-seq costs: scheduler tail, combine/dispatch overlap, or reducing producer/barrier pressure rather than moving a 1-2 float scale load.
+
+
+## 2026-06-24: 384-expert wave scheduling - useful only for the long typical cases
+
+Why I looked here:
+
+After the first SFB-SMEM pass, the PR360-standard table had a pattern: 256-expert models got clear SFB wins, but the 384-expert models were still slow, especially at `8192 tokens/rank`. That says the next bottleneck is probably not the tiny SFB load anymore. A better guess is scheduling overhead/tail behavior with `384 / 8 = 48` local experts.
+
+Key insight:
+
+`num_experts_per_wave` decides how many local experts one scheduling wave covers. Too small means many waves and more scheduler/barrier/tail overhead. Too large can reduce balance or hurt locality. So I first swept the wave value instead of changing the kernel body.
+
+Command shape:
+
+```bash
+DG_SM90_MOE_SFB_SMEM=-1 DG_SM90_MOE_EXPERTS_PER_WAVE=<1|2|4|8|16|24|48> \
+python3 /tmp/codex-pr360-tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 1024 4096 8192 \
+  --hidden <model-hidden> --intermediate-hidden <model-intermediate> \
+  --num-experts 384 --num-topk <model-topk> --num-tests 7
+```
+
+Correction while testing:
+
+I initially thought one broad 48-local-expert rule was enough. That was wrong. With SFB enabled, the best wave depends on the model shape, and `4096 tokens/rank` is noisy enough that the mean does not clearly justify changing it. I also hit a build-cache trap: `pip install --force-reinstall` reused `work/codex-pr360/src/build/python_api.o`, so the new heuristic did not enter `_C`. I fixed this by deleting `work/codex-pr360/src/build` before rebuilding. Lesson: when a C++ header-only heuristic changes, clean the extension build cache.
+
+Exploration result under the current SFB-on code:
+
+| model | tokens/rank | old auto wave | tested best wave | read |
+| --- | ---: | ---: | ---: | --- |
+| V4 Pro | 4096 | 2 | 16 sometimes, 2 sometimes | not stable; keep old auto |
+| V4 Pro | 8192 | 1 | 16 | stable win |
+| MiMo-Pro | 4096 | 2 | 24/48 sometimes | not stable; keep old auto |
+| MiMo-Pro | 8192 | 1 | 24 | stable win |
+
+Final rule:
+
+- V4 Pro 384-expert shape (`hidden=7168`, `intermediate=3072`, `topk=6`): use `wave=16` only when `tokens_per_expert >= 1024`.
+- MiMo-Pro 384-expert shape (`hidden=6144`, `intermediate=2048`, `topk=8`): use `wave=24` only when `tokens_per_expert >= 1024`.
+- Keep `4096 tokens/rank` on old auto. This is important: avoiding a weak/unstable win is also an optimization decision.
+
+Why the timings move by hundreds of us:
+
+The reported line is already an inner average from `bench_kineto`, but each outer process still samples routing and runs distributed rendezvous/NVSHMEM work. Small changes in received-token distribution and communication timing can move a multi-rank MoE run by hundreds of microseconds. So I used repeated outer runs and reported mean/std, not the single best number.
+
+Final 8192-token repeated test (`5` valid outer runs, each with `--num-tests 7`):
+
+| model | tokens/rank | tokens/expert | old wave | old mean | old std | new wave | new mean | new std | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| V4 Pro (best wave=16) | 8192 | 1024.0 | 1 | 10560.5 us | 75.5 | 16 | 9808.0 us | 89.8 | +7.67% |
+| MiMo-Pro (best wave=24) | 8192 | 1365.3 | 1 | 7797.7 us | 39.9 | 24 | 7518.1 us | 53.2 | +3.72% |
+
+Rough comparison to the earlier PR360 direct-SFB table:
+
+| model | old PR360-style fused path | final 8192 mean | rough gain |
+| --- | ---: | ---: | ---: |
+| V4 Pro | 10677.6 us | 9808.0 us | +8.87% |
+| MiMo-Pro | 7983.5 us | 7518.1 us | +6.19% |
+
+Takeaway:
+
+For 384 experts, the useful feature is not a new math trick. It is making the wave size match the long-token scheduling problem. The important part was the correction: `4096` looked tempting in single runs, but repeated tests showed it was not reliable. The final change only touches the long typical cases where the signal survives averaging.
+
+
+## 2026-06-24: Combined result table with baseline column
+
+What this table means:
+
+- `PR360-style original` is the earlier fused path before my current changes for that row.
+- `Current final` is the final heuristic stack that applies to the row: low-token pingpong wave tuning, SFB-in-SMEM auto range, and the 384-expert long-token wave rule.
+- `Official baseline` follows the benchmark's own `--baseline --baseline-version both` path. In code this prints `baseline[v1-contig]`, `baseline[v1-ll]`, and `baseline[v2]`. I am leaving it `n/a` because I did not find public numeric rows for these exact cases, and the local baseline path still failed to load cleanly in this environment.
+
+Do not read the empty baseline cells as zero. They mean "not measured yet".
+
+Overall read:
+
+| group | cases | combined speedup read |
+| --- | ---: | --- |
+| PR360-standard model/token rows | 20 | mean `+2.76%`, range `+0.12%` to `+8.87%` |
+| Flash | 5 | mean `+2.54%`, range `+0.62%` to `+3.92%` |
+| V4 Pro | 5 | mean `+3.33%`, range `+1.21%` to `+8.87%` |
+| MiMo | 5 | mean `+3.07%`, range `+2.02%` to `+3.68%` |
+| MiMo-Pro | 5 | mean `+2.12%`, range `+0.12%` to `+6.19%` |
+| low-token pingpong sanity set | 8-128 tokens/rank | mean `+1.88%` |
+
+Detailed table:
+
+| model | tokens/rank | tokens/expert | PR360-style original | current final | combined speedup | official baseline |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Flash | 256 | 48.0 | 326.3 us | 324.3 us | +0.62% | n/a |
+| Flash | 512 | 96.0 | 345.7 us | 338.0 us | +2.28% | n/a |
+| Flash | 1024 | 192.0 | 597.0 us | 582.2 us | +2.54% | n/a |
+| Flash | 4096 | 768.0 | 1807.2 us | 1748.7 us | +3.35% | n/a |
+| Flash | 8192 | 1536.0 | 3546.7 us | 3412.8 us | +3.92% | n/a |
+| V4 Pro | 256 | 32.0 | 1051.1 us | 1035.2 us | +1.54% | n/a |
+| V4 Pro | 512 | 64.0 | 1097.1 us | 1083.0 us | +1.30% | n/a |
+| V4 Pro | 1024 | 128.0 | 1695.8 us | 1675.6 us | +1.21% | n/a |
+| V4 Pro | 4096 | 512.0 | 5307.1 us | 5115.4 us | +3.75% | n/a |
+| V4 Pro | 8192 | 1024.0 | 10677.6 us | 9808.0 us | +8.87% | n/a |
+| MiMo | 256 | 64.0 | 333.9 us | 327.3 us | +2.02% | n/a |
+| MiMo | 512 | 128.0 | 491.3 us | 476.1 us | +3.19% | n/a |
+| MiMo | 1024 | 256.0 | 758.4 us | 734.7 us | +3.23% | n/a |
+| MiMo | 4096 | 1024.0 | 2362.8 us | 2278.9 us | +3.68% | n/a |
+| MiMo | 8192 | 2048.0 | 4799.2 us | 4649.6 us | +3.22% | n/a |
+| MiMo-Pro | 256 | 42.7 | 663.0 us | 652.9 us | +1.55% | n/a |
+| MiMo-Pro | 512 | 85.3 | 701.1 us | 690.5 us | +1.54% | n/a |
+| MiMo-Pro | 1024 | 170.7 | 1269.9 us | 1255.0 us | +1.19% | n/a |
+| MiMo-Pro | 4096 | 682.7 | 3912.9 us | 3908.1 us | +0.12% | n/a |
+| MiMo-Pro | 8192 | 1365.3 | 7983.5 us | 7518.1 us | +6.19% | n/a |
+
+Teaching point:
+
+The big lesson from the total table is that SFB-in-SMEM is a broad small win, while the 384-expert wave rule is a narrow bigger win. If I only looked at average speedup, the work would look modest. If I look by model shape, the useful next direction becomes clearer: 384-expert long-token scheduling is still where the largest remaining opportunity is.

@@ -301,11 +301,26 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const int num_experts_per_wave_auto = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
+    const float tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     // On the H200/L20X default shape (32 local experts), large-token cooperative
     // runs are more stable when the whole local expert set is one wave.
-    const int num_experts_per_wave_tuned = (num_tokens >= 1024 and num_experts_per_rank == 32)
-                                               ? 32
-                                               : num_experts_per_wave_auto;
+    // For 384-expert PR360 models (48 local experts), the shared auto rule
+    // picks tiny waves at long tokens/rank. Current SFB-on testing showed the
+    // 4096-token point is noisy/neutral, while 8192 is consistently faster with
+    // model-specific larger waves, so gate this tuning by tokens/expert >= 1024.
+    const bool is_v4_pro_384 = (num_experts_per_rank == 48 and hidden == 7168 and
+                                intermediate_hidden == 3072 and num_topk == 6);
+    const bool is_mimo_pro_384 = (num_experts_per_rank == 48 and hidden == 6144 and
+                                  intermediate_hidden == 2048 and num_topk == 8);
+    const int num_experts_per_wave_tuned = (is_v4_pro_384 and tokens_per_expert >= 1024.0f)
+                                               ? 16
+                                               : (is_mimo_pro_384 and tokens_per_expert >= 1024.0f)
+                                                     ? 24
+                                                     : (num_experts_per_rank == 48 and tokens_per_expert >= 1024.0f)
+                                                           ? 24
+                                                           : (num_tokens >= 1024 and num_experts_per_rank == 32)
+                                                                 ? 32
+                                                                 : num_experts_per_wave_auto;
     const int num_experts_per_wave_override = get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE", 0);
     const int num_experts_per_wave = num_experts_per_wave_override > 0
                                          ? std::min(num_experts_per_wave_override, num_experts_per_rank)
@@ -318,7 +333,6 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     // weight (L2 B operand) is large and low-reuse and the M-major order thrashes
     // L2 (measured 47% hit / 97% L2 busy). N-major keeps each weight N-column
     // resident while sweeping m. Threshold matches the megamoe_sm90 branch.
-    const float tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     // DIAGNOSTIC: DG_SM90_MOE_NMAJOR overrides the N-major heuristic (-1=auto, 0=off, 1=on).
     const int nmajor_override = get_env<int>("DG_SM90_MOE_NMAJOR", -1);
     const bool l2_nmajor_schedule = nmajor_override < 0
