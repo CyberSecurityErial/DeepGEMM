@@ -1521,3 +1521,52 @@ Detailed table:
 Teaching point:
 
 The big lesson from the total table is that SFB-in-SMEM is a broad small win, while the 384-expert wave rule is a narrow bigger win. If I only looked at average speedup, the work would look modest. If I look by model shape, the useful next direction becomes clearer: 384-expert long-token scheduling is still where the largest remaining opportunity is.
+
+
+## 2026-06-24: 384-expert L1 schedule exploration - promising but not confirmed
+
+Why I looked here:
+
+After wave tuning, the remaining 384-expert long-token cases still looked scheduling-sensitive. The next non-trivial idea was not another wave value, but changing block order:
+
+- Default L1 order is M-major: keep the same activation M block while sweeping N blocks.
+- `DG_SM90_MOE_L1_NMAJOR=1` flips L1 to N-major: keep one L1 weight N tile hot while sweeping M blocks.
+- `DG_SM90_MOE_EXPERT_LOCAL=1` changes phase order: do L1 and L2 per expert instead of doing L1 for a wave, then L2 for that wave.
+
+Hypothesis:
+
+If long 384-expert cases are losing time to L1 weight locality or wave tail behavior, L1 N-major or expert-local scheduling could help. If activation reuse is still more valuable, it will hurt. This is a real feature test because the scheduler state machine changes; it is not just changing one threshold.
+
+Quick sweep (`8192 tokens/rank`, `--num-tests 5`, same clean `/tmp` install):
+
+| model | variant | time | vs base | read |
+| --- | --- | ---: | ---: | --- |
+| MiMo-Pro | base | 7338.2 us | 0.00% | current final |
+| MiMo-Pro | L1 N-major | 7183.8 us | +2.15% | promising |
+| MiMo-Pro | expert-local | 7610.9 us | -3.58% | reject alone |
+| MiMo-Pro | L1 N-major + expert-local | 7791.1 us | -5.81% | reject |
+| MiMo-Pro | L2 N-major off | 7329.7 us | +0.12% | basically neutral |
+| V4 Pro | base | 9713.5 us | 0.00% | current final |
+| V4 Pro | L1 N-major | 10088.0 us | -3.71% | reject alone |
+| V4 Pro | expert-local | 10275.2 us | -5.47% | reject alone |
+| V4 Pro | L1 N-major + expert-local | 9523.8 us | +1.99% | promising but suspicious |
+| V4 Pro | L2 N-major off | 9776.3 us | -0.64% | keep default |
+
+What I learned:
+
+MiMo-Pro and V4 Pro do not want the same scheduler. MiMo-Pro likes L1 N-major in the quick sweep, but V4 Pro hates it unless it is combined with expert-local. That means a single "384 experts => L1 N-major" rule would be wrong.
+
+Correction:
+
+I started a 5-run repeat, but the numbers inflated from the 7-10 ms range to 14-23 ms. `nvidia-smi pmon` showed another 8-GPU LLaMA training job using all GPUs (`torchrun_main.py`, PIDs 4035998-4036005). I did not kill it because it is not this benchmark. This repeat is invalid and should not drive a heuristic change.
+
+Current decision:
+
+Do not enable this by default yet. The next valid step, when GPUs are free, is to repeat only two candidates:
+
+- MiMo-Pro 384, `8192 tokens/rank`: base vs `DG_SM90_MOE_L1_NMAJOR=1`.
+- V4 Pro 384, `8192 tokens/rank`: base vs `DG_SM90_MOE_L1_NMAJOR=1 DG_SM90_MOE_EXPERT_LOCAL=1`.
+
+Teaching point:
+
+This is exactly why repeated measurements matter. A quick sweep is allowed to generate hypotheses. A default heuristic needs repeatable mean/std under a clean GPU. The useful optimization idea here is "model-specific L1 scheduling for long 384-expert cases", but it is not proven yet.
