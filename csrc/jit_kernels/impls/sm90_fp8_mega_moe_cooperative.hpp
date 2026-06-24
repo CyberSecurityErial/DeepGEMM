@@ -82,6 +82,8 @@ public:
 // cooperative_v5: optional L1 topk-weight fusion behind DG_SM90_MOE_FUSE_TOPK_WEIGHT.
 // cooperative_v6: fast rank select for kNumRanks <= 32 behind DG_SM90_MOE_FAST_RANK_SELECT.
 // cooperative_v7: optional L1 N-major scheduler behind DG_SM90_MOE_L1_NMAJOR.
+// cooperative_v8: optional expert-local L1->L2 scheduler behind DG_SM90_MOE_EXPERT_LOCAL.
+// cooperative_v9: optional SMEM-staged weight SF behind DG_SM90_MOE_SFB_SMEM.
 // Eliminate all vprintf calls that cause ptxas C7510 (WGMMA pipeline
 // serialization due to function call boundary):
 // 1. DG_DEVICE_ASSERT → trap-only (no printf)
@@ -109,6 +111,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -126,6 +130,8 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.config.l2_nmajor_schedule ? "true" : "false",
     args.config.l1_nmajor_schedule ? "true" : "false",
+    args.config.expert_local_schedule ? "true" : "false",
+    args.config.sfb_in_smem ? "true" : "false",
     args.phase_profile ? "true" : "false",
     args.fuse_topk_weight ? "true" : "false",
     args.fast_rank_select ? "true" : "false");

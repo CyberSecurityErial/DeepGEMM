@@ -54,6 +54,14 @@ struct MegaMoESM90Config {
     // potential L1 weight reuse and is controlled separately from L2.
     bool l1_nmajor_schedule;
 
+    // Experimental expert-local phase order: for each expert, run its L1 blocks
+    // then its L2 blocks before advancing to the next expert in the wave.
+    bool expert_local_schedule;
+
+    // Experimental path: B-loader warp loads weight scale factors into SMEM
+    // per pipeline stage so math warpgroups do not issue global SF loads.
+    bool sfb_in_smem;
+
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -70,6 +78,8 @@ struct MegaMoESM90Config {
            << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", l2_nmajor_schedule=" << config.l2_nmajor_schedule
            << ", l1_nmajor_schedule=" << config.l1_nmajor_schedule
+           << ", expert_local_schedule=" << config.expert_local_schedule
+           << ", sfb_in_smem=" << config.sfb_in_smem
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -132,7 +142,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
-    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const bool& sfb_in_smem = false) {
     constexpr int kSmemAlignment = 1024;
 
     // Dispatch region (same as SM100)
@@ -154,10 +165,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
     //     and L2 (2 * BLOCK_M floats, per-64 K), aligned to 128 bytes
-    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
-    //     weight quantization), so no SMEM is reserved for it.
+    //   * SFB can optionally be staged by the B-loader warp into SMEM
+    //     (2 floats per stage covers L1 gate/up; L2 uses only slot 0).
     const int smem_sfa_per_stage = align(2 * block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage = 0;
+    const int smem_sfb_per_stage = sfb_in_smem ? align(2 * static_cast<int>(sizeof(float)), 128) : 0;
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile
     const int smem_per_stage = block_m * block_k + block_n * block_k +
@@ -230,12 +241,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
     const bool l1_nmajor_schedule = false;
+    const bool expert_local_schedule = false;
+    const bool sfb_in_smem = false;
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        sfb_in_smem);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -243,7 +257,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule, l1_nmajor_schedule,
+        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, sfb_in_smem,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
@@ -313,12 +327,25 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     // DIAGNOSTIC: DG_SM90_MOE_L1_NMAJOR overrides the experimental L1 order (-1=auto/off, 0=off, 1=on).
     const int l1_nmajor_override = get_env<int>("DG_SM90_MOE_L1_NMAJOR", -1);
     const bool l1_nmajor_schedule = l1_nmajor_override > 0;
+    // DIAGNOSTIC: DG_SM90_MOE_EXPERT_LOCAL tests per-expert L1->L2 scheduling.
+    const bool expert_local_schedule = get_env<int>("DG_SM90_MOE_EXPERT_LOCAL", 0) != 0;
+    // DG_SM90_MOE_SFB_SMEM controls staging weight SF through SMEM:
+    //   -1/unspecified: auto, enabled only in the measured medium-long band.
+    //    0: force off, 1: force on.
+    // The 2-rank H200 shape showed wins at tokens_per_expert=512..4096 and
+    // a small regression at 8192, where producer-side work dominates the tiny
+    // scale-load saving.
+    const int sfb_smem_override = get_env<int>("DG_SM90_MOE_SFB_SMEM", -1);
+    const bool sfb_in_smem = sfb_smem_override < 0
+                                  ? (tokens_per_expert >= 512.0f and tokens_per_expert <= 4096.0f)
+                                  : (sfb_smem_override != 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        sfb_in_smem);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -326,7 +353,7 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule, l1_nmajor_schedule,
+        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, sfb_in_smem,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };

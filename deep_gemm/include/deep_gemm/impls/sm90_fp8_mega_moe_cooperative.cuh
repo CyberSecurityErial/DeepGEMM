@@ -68,6 +68,8 @@ template <
     bool kFastMath,
     bool kL2NMajorSchedule,
     bool kL1NMajorSchedule,
+    bool kExpertLocalSchedule,
+    bool kSFBInSMEM,
     bool kPhaseProfile,
     bool kFuseTopkWeight,
     bool kFastRankSelect,
@@ -216,9 +218,12 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>(2 * BLOCK_M * sizeof(float), 128u);
     // Block (128, 128) weight SF: 1 float per (BLOCK_N, BLOCK_K) tile for L2,
-    // 2 floats (gate/up) for L1. Loaded by math warpgroup directly from global,
-    // so no SMEM is needed.
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = 0;
+    // 2 floats (gate/up) for L1. The default path loads these directly from
+    // global in the math warpgroups. The experimental path stages them in SMEM
+    // via the B-loader warp to remove global SF loads from math.
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kSFBInSMEM
+                                                     ? math::constexpr_align<uint32_t>(2 * sizeof(float), 128u)
+                                                     : 0;
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte) and
     // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes).  The tile covers the full
@@ -257,13 +262,17 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     auto smem_sfa     = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
+    auto smem_sfb     = utils::PatternVisitor([=](const uint32_t& i) {
+        return reinterpret_cast<float*>(sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE +
+                                        i * SMEM_SFB_SIZE_PER_STAGE);
+    });
 
-    // Barriers live after SF (SFB is loaded directly from global, no SMEM).
+    // Barriers live after SF.
     // Layout: dispatch | full | empty | combine | order
     //   order_barriers: pingpong `OrderedSequenceBarrier<2,2>` flattened as
     //   `[ord_stage * 2 + wg]`, 2 stages (MMA/EPI) x 2 math WGs.
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
-        sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
+        sf_start_ptr + kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) {
         return barrier_start_ptr + i;
     });
@@ -334,7 +343,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule, kL1NMajorSchedule>(workspace);
+        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule, kL1NMajorSchedule,
+        kExpertLocalSchedule>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -805,10 +815,31 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                    // TMA load B (weight SF is now loaded directly by math warps from global)
+                    // TMA load B. Optional SFB staging moves the tiny weight-scale
+                    // global loads from both math WGs to this single producer warp.
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                         k_idx, n_idx, 1);
+
+                    if constexpr (kSFBInSMEM) {
+                        constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
+                        constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
+                        constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
+                        constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
+                        constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
+                        if (block_phase == sched::BlockPhase::Linear1) {
+                            const float* l1_sf_base = l1_weights_sf + local_expert_idx * kL1SFPerExpert;
+                            const uint32_t gate_n   = n_block_idx / 2u;
+                            const uint32_t up_n     = kL1SFGateBlks + gate_n;
+                            smem_sfb[stage_idx][0]  = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + k_block_idx);
+                            smem_sfb[stage_idx][1]  = __ldg(l1_sf_base + up_n * kL1SFKBlocks + k_block_idx);
+                        } else {
+                            const float* l2_sf_base = l2_weights_sf + local_expert_idx * kL2SFPerExpert +
+                                                      n_block_idx * kL2SFKBlocks;
+                            smem_sfb[stage_idx][0]  = __ldg(l2_sf_base + k_block_idx);
+                            smem_sfb[stage_idx][1]  = 0.0f;
+                        }
+                    }
 
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
                 }
@@ -927,13 +958,15 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
             const float* l1_sf_base = l1_weights_sf + local_expert_idx * kL1SFPerExpert;
             const float* l2_sf_base = l2_weights_sf + local_expert_idx * kL2SFPerExpert + n_block_idx * kL2SFKBlocks;
-            if (block_phase == sched::BlockPhase::Linear1) {
-                const uint32_t gate_n = n_block_idx / 2u;
-                const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + 0);
-                up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + 0);
-            } else {
-                l2_sf = __ldg(l2_sf_base + 0);
+            if constexpr (!kSFBInSMEM) {
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    const uint32_t gate_n = n_block_idx / 2u;
+                    const uint32_t up_n   = kL1SFGateBlks + gate_n;
+                    gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + 0);
+                    up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + 0);
+                } else {
+                    l2_sf = __ldg(l2_sf_base + 0);
+                }
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -967,6 +1000,11 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     // Read act SF while WGMMA is executing (overlapped with async MMA)
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + sfa_row_off + r_1);
+                    float cur_gate_sf = gate_sf, cur_up_sf = up_sf;
+                    if constexpr (kSFBInSMEM) {
+                        cur_gate_sf = ptx::ld_shared(smem_sfb[stage_idx] + 0);
+                        cur_up_sf   = ptx::ld_shared(smem_sfb[stage_idx] + 1);
+                    }
 
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++i)
@@ -976,16 +1014,17 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    // Software-pipelined weight SF prefetch for NEXT k-block.
-                    // Issued here so the ~200-cycle __ldg latency is hidden by
-                    // SF-scaling below + loop overhead + next wait_full_bar.
-                    const float cur_gate_sf = gate_sf, cur_up_sf = up_sf;
-                    if (k_block_idx + 1 < num_k_blocks) {
-                        const uint32_t next_k = k_block_idx + 1;
-                        const uint32_t gate_n = n_block_idx / 2u;
-                        const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                        gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + next_k);
-                        up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + next_k);
+                    if constexpr (!kSFBInSMEM) {
+                        // Software-pipelined weight SF prefetch for NEXT k-block.
+                        // Issued here so the ~200-cycle __ldg latency is hidden by
+                        // SF-scaling below + loop overhead + next wait_full_bar.
+                        if (k_block_idx + 1 < num_k_blocks) {
+                            const uint32_t next_k = k_block_idx + 1;
+                            const uint32_t gate_n = n_block_idx / 2u;
+                            const uint32_t up_n   = kL1SFGateBlks + gate_n;
+                            gate_sf               = __ldg(l1_sf_base + gate_n * kL1SFKBlocks + next_k);
+                            up_sf                 = __ldg(l1_sf_base + up_n * kL1SFKBlocks + next_k);
+                        }
                     }
 
                     // L1: gate/up alternate at gran=8 along N; each `i` block of 8
@@ -1010,6 +1049,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 } else {
 // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
 // First half: K=0..63, SFA = scale_a_*_lo
+                    float cur_l2_sf = l2_sf;
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++i)
                         ptx::warpgroup_fence_operand(accum[i]);
@@ -1027,6 +1067,9 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     // Read L2 lo-half act SF while first-half WGMMA is executing
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + sfa_row_off + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + sfa_row_off + r_1);
+                    if constexpr (kSFBInSMEM) {
+                        cur_l2_sf = ptx::ld_shared(smem_sfb[stage_idx] + 0);
+                    }
 
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread; ++i)
@@ -1035,8 +1078,8 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
 
 // L2 first half: single scalar `l2_sf` broadcast across N. Pre-multiply
 // act-SF × weight-SF once (2 muls) → inner loop is pure FMA.
-                    const float s0_lo = scale_a_0_lo * l2_sf;
-                    const float s1_lo = scale_a_1_lo * l2_sf;
+                    const float s0_lo = scale_a_0_lo * cur_l2_sf;
+                    const float s1_lo = scale_a_1_lo * cur_l2_sf;
 #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++i) {
                         final_accum[i * 4 + 0] += s0_lo * accum[i * 4 + 0];
@@ -1073,10 +1116,11 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    // Software-pipelined weight SF prefetch for NEXT k-block.
-                    const float cur_l2_sf = l2_sf;
-                    if (k_block_idx + 1 < num_k_blocks) {
-                        l2_sf = __ldg(l2_sf_base + k_block_idx + 1);
+                    if constexpr (!kSFBInSMEM) {
+                        // Software-pipelined weight SF prefetch for NEXT k-block.
+                        if (k_block_idx + 1 < num_k_blocks) {
+                            l2_sf = __ldg(l2_sf_base + k_block_idx + 1);
+                        }
                     }
 
                     // L2 second half: same broadcast scalar `cur_l2_sf`. Pre-multiply

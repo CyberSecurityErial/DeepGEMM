@@ -25,6 +25,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kClusterSize = 2,
           bool kL2NMajorSchedule = false,
           bool kL1NMajorSchedule = false,
+          bool kExpertLocalSchedule = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -174,8 +175,63 @@ struct MegaMoEScheduler {
         return false;
     }
 
+    CUTLASS_DEVICE bool map_current_l1_block(const uint32_t& num_m_blocks) {
+        if (block_idx >= num_m_blocks * kNumL1BlockNs)
+            return false;
+        if constexpr (kL1NMajorSchedule) {
+            n_block_idx = block_idx / num_m_blocks;
+            m_block_idx = block_idx - n_block_idx * num_m_blocks;
+        } else {
+            m_block_idx = block_idx / kNumL1BlockNs;
+            n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+        }
+        return true;
+    }
+
+    CUTLASS_DEVICE bool map_current_l2_block(const uint32_t& num_m_blocks) {
+        if (block_idx >= num_m_blocks * kNumL2BlockNs)
+            return false;
+        if constexpr (kL2NMajorSchedule) {
+            n_block_idx = block_idx / num_m_blocks;
+            m_block_idx = block_idx - n_block_idx * num_m_blocks;
+        } else {
+            m_block_idx = block_idx / kNumL2BlockNs;
+            n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+        }
+        return true;
+    }
+
+    CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block_expert_local() {
+        while (current_local_expert_idx < kNumExpertsPerRank) {
+            const auto wave_end_expert_idx = get_wave_expert_end_idx();
+            while (current_local_expert_idx < wave_end_expert_idx) {
+                const auto num_m_blocks = get_current_num_m_blocks();
+                if (next_phase == BlockPhase::Linear1) {
+                    if (map_current_l1_block(num_m_blocks)) {
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
+                    block_idx -= num_m_blocks * kNumL1BlockNs;
+                    next_phase = BlockPhase::Linear2;
+                } else {
+                    if (map_current_l2_block(num_m_blocks)) {
+                        block_idx += kNumSMs;
+                        return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
+                    block_idx -= num_m_blocks * kNumL2BlockNs;
+                    next_phase = BlockPhase::Linear1;
+                    advance_expert_idx();
+                }
+            }
+        }
+        return {BlockPhase::None, 0, 0, 0};
+    }
+
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
+        if constexpr (kExpertLocalSchedule)
+            return get_next_block_expert_local();
+
         while (true) {
             if (current_local_expert_idx >= kNumExpertsPerRank)
                 break;

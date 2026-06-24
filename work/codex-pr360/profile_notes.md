@@ -1039,3 +1039,305 @@ Sanity benchmark:
 | 32768 | 35647.1 | 648.0 |
 
 This is within the normal run-to-run band of the fast-rank default path. The failed L1 N-major experiment is not enabled by default; the direct-scatter code was not kept after profiling showed it was clearly worse.
+
+
+## 2026-06-23: L1 weight scale pointer hoist, failed but useful
+
+### Why I tried it
+From the phase split, long sequence time is dominated by `math_loop`; L1 tiles are much heavier than L2 tiles, while L1 epilogue is only a small fraction. In the L1 K loop we repeatedly recompute:
+
+- `gate_n = n_block_idx / 2`
+- `up_n = kL1SFGateBlks + gate_n`
+- `l1_sf_base + n * kL1SFKBlocks + k`
+
+Hypothesis: hoist the gate/up scale base pointers once per tile, then only add `next_k` in the loop. If integer address arithmetic is visible in the hot path, this should help more at 32768/65536 than at short lengths.
+
+### Correction during measurement
+The first 8-rank rerun was not clean: `nvidia-smi pmon` showed other jobs on GPUs 0-4, so full 8-GPU timing could not be trusted. I did not kill those jobs. Instead, I used free GPUs 5/6 with `CUDA_VISIBLE_DEVICES=5,6`, `--num-processes 2`, and moved JIT caches to `/tmp` because `/home` was over quota.
+
+### Result
+Correctness smoke passed: `L1.smoke diff=0`.
+
+2-rank A/B on GPUs 5/6, same code except the one header:
+
+| batch | clean, repeat=20 | hoist, repeat=20 | delta |
+| --- | ---: | ---: | ---: |
+| 32768 | 40049.5 us | 40475.0 us | -1.06% |
+| 65536 | 76353.8 us | 76950.0 us | -0.78% |
+
+Earlier repeat=5 samples were noisy and even briefly favored hoist, but the higher-repeat long-seq run says the change is not a reliable win.
+
+### Conclusion
+I reverted it. The useful lesson is negative: this L1 hot path is not mainly limited by the small integer address calculation for weight scales. The stricter bottleneck is more likely WGMMA/TMA/scale-load scheduling, register pressure, or tail/rank imbalance. This also explains why a seemingly harmless pointer hoist can lose: it may extend pointer live ranges and make scheduling/register allocation slightly worse.
+
+
+## 2026-06-23: Correction - "WGMMA slow" is not proven yet
+
+I kept saying the bottleneck is probably WGMMA. That needs a sharper wording.
+
+What the current data proves:
+
+- Long sequence time is dominated by the GEMM mainloop.
+- L1 tile time is much larger than L2 tile time.
+- L1/L2 epilogues are small compared with tile time.
+- Removing small address arithmetic did not help.
+- Direct L2 scatter made the mainloop and epilogue worse, so layout/register pressure matters.
+
+What this does **not** prove:
+
+- It does not prove the WGMMA instruction itself is slow.
+- It does not prove tensor core utilization is low.
+- It does not distinguish WGMMA compute limit from scale-load latency, TMA/SMEM wait, register pressure, or scheduler tail imbalance.
+
+Better mental model:
+
+The bottleneck is currently "inside the WGMMA mainloop region", not necessarily "WGMMA instruction throughput". On SM90, accumulator registers, scale values, TMA/SMEM staging, and WGMMA issue all live in the same tight loop. A small feature can lose if it increases live ranges or scheduling pressure.
+
+How to verify next:
+
+Use NCU on one long case, and look for:
+
+- tensor pipe active / tensor pipe utilization: proves whether tensor cores are saturated.
+- eligible warps and issue stalls: tells whether warps are ready but not issuing.
+- long scoreboard / memory dependency stalls: points to scale/TMA/SMEM latency.
+- register count and occupancy: tells whether extra feature code is choking scheduling.
+- L1 vs L2 phase counters: keeps the metric tied back to MegaMoE phases.
+
+So the next optimization should not start with "make WGMMA faster". It should start with: identify which part of the mainloop prevents WGMMA from being fed or overlapped.
+
+
+## 2026-06-23: Expert-local L1->L2 scheduling experiment
+
+### Why I tried it
+The scheduler had a TODO about better block swizzle inside expert waves. Current cooperative order is wave-level:
+
+1. run L1 for every expert in the wave;
+2. then run L2 for every expert in the wave.
+
+For long sequences, one expert has many M blocks. I tested a different phase order:
+
+1. run one expert's L1 blocks;
+2. immediately run that expert's L2 blocks;
+3. then advance to the next expert.
+
+The bet: L2 may see fresher L1 output / metadata and shorter tail waiting. The risk: some CTAs may enter L2 early and spin on that expert's L1 arrival mask, wasting work that could have gone to later experts.
+
+### Implementation
+Added a default-off switch:
+
+- `DG_SM90_MOE_EXPERT_LOCAL=0`: current wave-level order.
+- `DG_SM90_MOE_EXPERT_LOCAL=1`: experimental expert-local L1->L2 order.
+
+This is not a parameter tweak; it changes the persistent scheduler's flattened block stream. The kernel math/epilogue code is unchanged.
+
+### Correctness
+2-rank correctness with expert-local enabled:
+
+- L1 smoke: passed, `diff=0`.
+- L1-L4 full set: 32/32 passed, all `diff=0`.
+
+### Measurement caveat
+The machine was not clean: another python process was attached to all 8 GPUs, and some GPUs had high memory use. I used physical GPUs 0/7 for 2-rank A/B and `/tmp` JIT caches. These numbers are useful for direction, not final 8-rank proof.
+
+### Result
+2-rank, `tokens=32768`:
+
+| run | default | expert-local | delta |
+| --- | ---: | ---: | ---: |
+| repeat=10 | 35969.9 us | 35844.3 us | +0.35% |
+| repeat=20 | 37141.7 us | 37415.9 us | -0.74% |
+| repeat=10 | 35801.3 us | 35744.4 us | +0.16% |
+
+Average across these noisy runs: default 36304.3 us, expert-local 36334.9 us, about **-0.08%**.
+
+2-rank, `tokens=65536`:
+
+| default | expert-local | delta |
+| ---: | ---: | ---: |
+| 68912.0 us | 69225.5 us | -0.45% |
+
+Phase profile for `tokens=32768` showed a useful signal:
+
+| metric | default | expert-local |
+| --- | ---: | ---: |
+| time | 36275.1 us | 35863.6 us |
+| math_loop | 52.405M cycles | 52.062M cycles |
+| combine_barrier | 2.439M cycles | 0.077M cycles |
+| l1_tile avg | 55.5k | 54.7k |
+| l2_tile avg | 24.3k | 24.2k |
+
+### Conclusion
+Do not enable this by default now. End-to-end long-seq speed did not improve reliably, and 65536 was slightly worse.
+
+The useful lesson: phase order can affect tail/barrier time, not just cache locality. Expert-local reduced `combine_barrier` in one profiled run, but that did not convert into stable wall-clock gain. My current guess is that earlier L2 starts sometimes reduce final tail, but sometimes make CTAs wait on per-pool L1 arrival masks and disturb global load balance.
+
+Next time this is worth revisiting only with a cleaner 8-GPU run and perhaps a less extreme variant: not per-expert L1->L2, but smaller waves or a limited interleave after a group of experts.
+
+
+## 2026-06-23: NCU correction - mainloop is not WGMMA-throughput bound
+
+### Why I ran NCU
+I had been saying "probably WGMMA" too loosely. Phase counters only told me the time sits in the GEMM mainloop region. They did not tell me whether tensor cores are full, whether we are waiting on memory, or whether barriers/tail dominate.
+
+### Profiling correction
+Trying NCU on the 2-rank distributed harness with application replay got stuck in replay pass 1. I interrupted only my own NCU process. No report was produced.
+
+Then I switched to a 1-rank long case to remove cross-process replay complexity:
+
+- `num_processes=1`
+- `tokens=32768`
+- cooperative kernel, default scheduler
+- `DG_JIT_WITH_LINEINFO=1`
+- report: `/tmp/codex-pr360-ncu-1r-32768/sm90-megamoe-default-1r-32768.ncu-rep`
+
+This is not final 8-rank performance evidence, but it is good enough to identify the kernel's single-SM mainloop behavior.
+
+### Key NCU numbers
+
+| metric | value | what it says |
+| --- | ---: | --- |
+| Compute / tensor pipe active | 40.31% | tensor pipe is not saturated |
+| L2 throughput | 62.21% | L2 path is busier than tensor pipe |
+| DRAM throughput | 30.20% | not pure HBM bandwidth bound |
+| One or more eligible warps | 36.45% | schedulers often have no ready warp |
+| No eligible | 63.55% | strong wait/dependency signal |
+| Active warps / scheduler | 2.96 | low, close to launch-limited occupancy |
+| Eligible warps / scheduler | 0.53 | not enough ready warps to feed issue slots |
+| Issued warp / scheduler | 0.36 | low issue utilization |
+| Registers / thread | 168 | occupancy/register pressure is real |
+
+Warp stall top entries:
+
+| stall | value |
+| --- | ---: |
+| Barrier | 2.63 |
+| Long scoreboard | 1.87 |
+| Wait | 0.82 |
+| Dispatch stall | 0.33 |
+| Branch resolving | 0.32 |
+| Short scoreboard | 0.16 |
+| GMMA | 0.13 |
+| MIO throttle | 0.13 |
+| Math pipe throttle | 0.09 |
+
+### Conclusion
+This corrects my earlier mental model. The kernel is not obviously WGMMA-throughput bound. Tensor pipe active is only ~40%, and GMMA stall is small compared with barrier and long scoreboard stalls.
+
+Better bottleneck guess now:
+
+1. barriers / phase handoff / persistent scheduler ordering;
+2. long scoreboard from TMA/global loads, likely A/SFA/B/SF or remote/scatter-dependent data;
+3. low eligible warps caused by register + smem limited occupancy;
+4. tensor cores are underfed rather than intrinsically slow.
+
+So the next useful optimization should target one of these:
+
+- reduce cross-warpgroup or per-tile barriers;
+- make more independent work available while waiting on L1/L2 arrival or TMA;
+- reduce register/live-range pressure so active/eligible warps improve;
+- reduce long-scoreboard global scale/load dependencies.
+
+This also explains why tiny address hoists did not help: the problem is not a few integer instructions; it is waiting and limited ready work.
+
+
+### Wave-size correction
+The first 1-rank NCU compiled with `num_experts_per_wave=2`, which is not the 8-rank long-seq shape. I reran 1-rank NCU with `DG_SM90_MOE_EXPERTS_PER_WAVE=32` to better match the target cooperative long-seq schedule.
+
+| metric | wave=2 | wave=32 |
+| --- | ---: | ---: |
+| duration | 32.21 ms | 33.32 ms |
+| tensor pipe active | 40.31% | 40.69% |
+| L2 throughput | 62.21% | 65.35% |
+| eligible warps / scheduler | 0.533 | 0.537 |
+| active warps / scheduler | 2.963 | 2.962 |
+| issued warp / scheduler | 0.36 | 0.37 |
+| registers / thread | 168 | 168 |
+| stall barrier | 2.63 | 2.77 |
+| stall long scoreboard | 1.87 | 1.73 |
+| stall wait | 0.82 | 0.82 |
+| stall GMMA | 0.13 | 0.12 |
+
+The correction matters methodologically, but not for the conclusion. Wave=32 still shows underfed tensor cores, low eligible warps, high barrier/scoreboard stalls, and small GMMA stall.
+
+
+## 2026-06-24: SFB-in-SMEM - useful, but only in the right length band
+
+### Why I tried it
+NCU said the math warpgroup is not WGMMA-throughput bound: tensor pipe is only ~40% active, and stalls include barrier + long scoreboard. That made me look for tiny global-load dependencies inside the math loop.
+
+The weight scale factor (SFB) is a good candidate: each GEMM tile needs only 1-2 floats, but the math warps load it from global. I tried moving those loads to the B-loader warp, storing 2 floats per pipeline stage in SMEM, then letting math warps read from SMEM after the full barrier.
+
+### What changed
+- Added `DG_SM90_MOE_SFB_SMEM`.
+- `1` forces SFB staging in SMEM.
+- `0` forces old direct global SFB loads.
+- default `-1/auto` enables it only when `tokens_per_expert` is in `[512, 4096]`.
+
+The auto band is important. I first thought this might be a general long-seq win. It is not.
+
+### Correctness
+Built isolated wheel/site:
+
+- wheel: `/tmp/codex-pr360-dist-sfb-auto/deep_gemm-2.5.0+local-cp312-cp312-linux_x86_64.whl`
+- site: `/tmp/codex-pr360-site-sfb-auto`
+
+Correctness passed:
+
+| mode | test | result |
+| --- | --- | --- |
+| forced off | L1 smoke | pass, diff=0 |
+| forced on | L1 smoke | pass, diff=0 |
+| forced on | L2/L3/L4, 31 cases | pass, diff=0 |
+| auto default | L1/L2/L3/L4, 32 cases | pass, diff=0 |
+
+### Performance result
+2 ranks, H200 shape, `hidden=7168`, `intermediate_hidden=2048`, `experts=256`, `topk=8`, cooperative kernel.
+
+| tokens | forced off | forced on | speedup | decision |
+| ---: | ---: | ---: | ---: | --- |
+| 8192 | 10178.1 us | 9775.9 us | +4.11% | enable |
+| 16384 | 18603.4 us | 18386.2 us | +1.18% | enable |
+| 32768 | 35654.4 us avg | 35035.7 us avg | +1.77% | enable |
+| 65536 | 72114.7 us avg | 71463.6 us avg | +0.91% | enable |
+| 131072 | 146262.0 us avg | 147038.0 us avg | -0.53% | disable |
+
+Auto run confirmed the heuristic:
+
+| tokens | auto `sfb_in_smem` | auto time |
+| ---: | ---: | ---: |
+| 8192 | 1 | 9786.8 us |
+| 16384 | 1 | 18314.0 us |
+| 32768 | 1 | 35748.6 us |
+| 65536 | 1 | 71349.4 us |
+| 131072 | 0 | 146001.3 us |
+
+### What phase profiling taught
+Phase profiling is noisy in absolute time, but it shows the direction.
+
+| tokens | metric | off | on | read |
+| ---: | --- | ---: | ---: | --- |
+| 32768 | `math_loop` | 52.316M | 50.434M | better |
+| 32768 | `l1_tile_loop avg` | 55.1k | 50.8k | better |
+| 32768 | `l2_tile_loop avg` | 24.5k | 25.2k | slightly worse |
+| 131072 | `math_loop` | 194.020M | 187.451M | better |
+| 131072 | `l1_tile_loop avg` | 54.5k | 50.6k | better |
+| 131072 | `l2_tile_loop avg` | 22.7k | 23.1k | slightly worse |
+
+So the feature does what it was designed to do: L1 tile loop gets cheaper. The miss was assuming that would always win end-to-end.
+
+### Why 131k regressed
+This is an Amdahl problem plus producer pressure.
+
+SFB is tiny: only 1-2 floats per tile. Moving it out of math can remove a scoreboard dependency, but it also adds producer-side global loads, SMEM stores, and 128B/stage more shared memory. At 131k, the whole run is dominated by a much larger steady-state math/dispatch body. The saved math-side scale latency is too small, while the producer and barrier side still pay the staging cost.
+
+Practical lesson: a micro-feature can be real and still need a length gate. Here the correct optimization is not "turn it on", but "turn it on only where measurement says the saved dependency is visible".
+
+### Current decision
+Keep SFB-in-SMEM, but auto-enable only for `tokens_per_expert` in `[512, 4096]`.
+
+For the tested 2-rank H200 shape that means:
+
+- 8192 / 16384 / 32768 / 65536 tokens: on.
+- 131072 tokens: off.
+
+Next useful idea: for 131k, SFB is not the right lever. The next feature should target larger long-seq costs: scheduler tail, combine/dispatch overlap, or reducing producer/barrier pressure rather than moving a 1-2 float scale load.
