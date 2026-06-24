@@ -233,21 +233,53 @@ struct MegaMoEScheduler {
             const auto wave_end_expert_idx = get_wave_expert_end_idx();
             while (current_local_expert_idx < wave_end_expert_idx) {
                 const auto num_m_blocks = get_current_num_m_blocks();
-                constexpr uint32_t kNumBlocksPerM = kNumL1BlockNs + kNumL2BlockNs;
-                if (block_idx < num_m_blocks * kNumBlocksPerM) {
-                    const uint32_t local_idx = block_idx;
-                    m_block_idx              = local_idx / kNumBlocksPerM;
-                    const uint32_t phase_idx = local_idx - m_block_idx * kNumBlocksPerM;
-                    block_idx += kNumSMs;
-                    if (phase_idx < kNumL1BlockNs) {
-                        n_block_idx = phase_idx;
-                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                const auto total_blocks = num_m_blocks * (kNumL1BlockNs + kNumL2BlockNs);
+                if (block_idx < total_blocks) {
+                    // Group enough M blocks so the L1 part alone covers at least
+                    // one persistent-grid wave. A one-M group can make many SMs
+                    // immediately take L2 blocks and spin on the L1 arrival mask.
+                    constexpr uint32_t kMLocalGroupM = math::constexpr_ceil_div(kNumSMs, kNumL1BlockNs);
+                    uint32_t local_idx = block_idx;
+                    uint32_t group_m_start = 0;
+                    while (group_m_start < num_m_blocks) {
+                        const uint32_t group_m = cute::min(kMLocalGroupM, num_m_blocks - group_m_start);
+                        const uint32_t group_l1_blocks = group_m * kNumL1BlockNs;
+                        const uint32_t group_l2_blocks = group_m * kNumL2BlockNs;
+                        const uint32_t group_blocks = group_l1_blocks + group_l2_blocks;
+                        if (local_idx < group_blocks) {
+                            block_idx += kNumSMs;
+                            if (local_idx < group_l1_blocks) {
+                                uint32_t m_in_group;
+                                if constexpr (kL1NMajorSchedule) {
+                                    n_block_idx = local_idx / group_m;
+                                    m_in_group = local_idx - n_block_idx * group_m;
+                                } else {
+                                    m_in_group = local_idx / kNumL1BlockNs;
+                                    n_block_idx = local_idx - m_in_group * kNumL1BlockNs;
+                                }
+                                m_block_idx = group_m_start + m_in_group;
+                                return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                            }
+
+                            local_idx -= group_l1_blocks;
+                            uint32_t m_in_group;
+                            if constexpr (kL2NMajorSchedule) {
+                                n_block_idx = local_idx / group_m;
+                                m_in_group = local_idx - n_block_idx * group_m;
+                            } else {
+                                m_in_group = local_idx / kNumL2BlockNs;
+                                n_block_idx = local_idx - m_in_group * kNumL2BlockNs;
+                            }
+                            m_block_idx = group_m_start + m_in_group;
+                            return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                        }
+
+                        local_idx -= group_blocks;
+                        group_m_start += group_m;
                     }
-                    n_block_idx = phase_idx - kNumL1BlockNs;
-                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
                 }
 
-                block_idx -= num_m_blocks * kNumBlocksPerM;
+                block_idx -= total_blocks;
                 advance_expert_idx();
             }
         }

@@ -1710,3 +1710,52 @@ python3 /tmp/codex-pr360-tests/bench_mega_moe_sm90.py \
 ```
 
 Then repeat MiMo-Pro too (`hidden=6144`, `intermediate=2048`, `topk=8`). If M-local loses, the lesson is still useful: shortening L1-to-L2 phase distance is not free because early L2 blocks can stall on the arrival mask.
+
+
+## 2026-06-24: M-local correction - group M blocks before timing
+
+Correction before running timing:
+
+The first M-local design was too literal: one M block's L1, then that same M block's L2. After looking again at the persistent scheduler, that can be bad before we even benchmark it. The tile list is not executed by one serial worker; all SMs take strided positions from the list. For V4 Pro, one M block has `48` L1 tiles and `56` L2 tiles. Since the machine has about `132` SMs, the first persistent-grid wave would already assign many SMs to L2 tiles, and those SMs would spin on the L1 arrival mask.
+
+Fix:
+
+I changed `DG_SM90_MOE_MLOCAL=1` to mean M-group-local:
+
+- choose `group_m = ceil(num_sms / num_l1_n_blocks)`, so the group's L1 part covers at least one SM wave;
+- within that M group, preserve the selected L1/L2 N-major policy;
+- run the group's L1 work first, then that group's L2 work.
+
+For the target 384-expert shapes this means roughly:
+
+| model | L1 N blocks | group_m read |
+| --- | ---: | ---: |
+| V4 Pro 384 | 48 | `ceil(132 / 48) = 3` |
+| MiMo-Pro 384 | 32 | `ceil(132 / 32) = 5` |
+
+Why this is better as an experiment:
+
+It still tests the same idea, shorter L1-to-L2 phase distance. But it avoids the obvious self-inflicted problem where L2 tiles are issued before enough L1 work has even been launched.
+
+Validation so far:
+
+| check | result |
+| --- | --- |
+| rebuilt clean install | passed, `/tmp/codex-pr360-site-mgrouplocal-20260624-172521` |
+| installed header has grouped path | passed |
+| offline NVCC compile, M-group-local on | passed, `/tmp/codex_mgrouplocal_compile_check.cubin` |
+| offline NVCC compile, default off | passed, `/tmp/codex_mgrouplocal_default_compile_check.cubin` |
+| dry-run confirm script | passed, `RUNS=0 work/codex-pr360/run_mlocal_schedule_confirm.sh` |
+| real 8-GPU timing | still blocked by another 8-GPU LLaMA job |
+
+Script prepared:
+
+```bash
+work/codex-pr360/run_mlocal_schedule_confirm.sh
+```
+
+It compares current default vs `DG_SM90_MOE_MLOCAL=1` for MiMo-Pro 384 and V4 Pro 384 at `8192 tokens/rank`, with `RUNS=5` and `NUM_TESTS=7` by default.
+
+Teaching point:
+
+This is a useful correction even before timing. A scheduler order that looks sequential on paper may not be sequential in a persistent-kernel grid. If the first wave already contains consumer tiles, the feature can manufacture idle waiting. That is why I changed the test from one-M local to M-group local before spending GPU time on it.

@@ -58,8 +58,8 @@ struct MegaMoESM90Config {
     // then its L2 blocks before advancing to the next expert in the wave.
     bool expert_local_schedule;
 
-    // Experimental M-local phase order: for each expert, run one M block's L1
-    // blocks, then that same M block's L2 blocks before advancing in M.
+    // Experimental M-local phase order: for each expert, run a small group of
+    // M blocks' L1 work, then that same group's L2 work before advancing in M.
     bool mlocal_schedule;
 
     // Experimental path: B-loader warp loads weight scale factors into SMEM
@@ -360,7 +360,7 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const bool expert_local_schedule = expert_local_override < 0
                                            ? auto_v4_pro_expert_local
                                            : (expert_local_override != 0);
-    // DIAGNOSTIC: DG_SM90_MOE_MLOCAL tests per-M-block L1->L2 scheduling.
+    // DIAGNOSTIC: DG_SM90_MOE_MLOCAL tests grouped per-M L1->L2 scheduling.
     const bool mlocal_schedule = get_env<int>("DG_SM90_MOE_MLOCAL", 0) != 0;
     // DG_SM90_MOE_SFB_SMEM controls staging weight SF through SMEM:
     //   -1/unspecified: auto, enabled only in the measured medium-long band.
