@@ -332,12 +332,12 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     // DG_SM90_MOE_SFB_SMEM controls staging weight SF through SMEM:
     //   -1/unspecified: auto, enabled only in the measured medium-long band.
     //    0: force off, 1: force on.
-    // The 2-rank H200 shape showed wins at tokens_per_expert=512..4096 and
-    // a small regression at 8192, where producer-side work dominates the tiny
-    // scale-load saving.
+    // PR360-standard 8-rank testing showed stable wins from the cooperative
+    // entry band (tokens_per_expert around 32) through 4096 and a regression at
+    // 8192, where producer-side work dominates the tiny scale-load saving.
     const int sfb_smem_override = get_env<int>("DG_SM90_MOE_SFB_SMEM", -1);
     const bool sfb_in_smem = sfb_smem_override < 0
-                                  ? (tokens_per_expert >= 512.0f and tokens_per_expert <= 4096.0f)
+                                  ? (tokens_per_expert >= 32.0f and tokens_per_expert <= 4096.0f)
                                   : (sfb_smem_override != 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
