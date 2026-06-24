@@ -1656,3 +1656,57 @@ I rebuilt a clean install at `/tmp/codex-pr360-site-l1auto-20260624-164016` and 
 Teaching point:
 
 This is the first scheduling feature after wave tuning that survived a clean repeated test. The important trick was not "turn on L1 N-major everywhere". The data says the right move is model-specific: MiMo-Pro wants L1 weight locality, while V4 Pro only benefits when the phase order also becomes expert-local. That is why the heuristic is narrow.
+
+
+## 2026-06-24: M-local scheduler hypothesis prepared, timing blocked by busy GPUs
+
+Why I looked here:
+
+The current long-token wins came from changing schedule order, not from tiny arithmetic cleanup. After L1 N-major, the next real schedule question is whether L2 should wait for the whole wave's L1, or start as soon as one M block has all its L1 N blocks ready.
+
+Hypothesis:
+
+Default wave-level order keeps L1 broad and simple: run L1 for the wave, then L2 for the wave. The new `DG_SM90_MOE_MLOCAL=1` experiment changes the order inside each expert to:
+
+1. pick one M block,
+2. run all L1 N blocks for that M block,
+3. then run all L2 N blocks for the same M block.
+
+If the bottleneck is L2 input residency / phase distance, this could help. If the cost is mainly waiting for L1 completion or losing weight locality, it will hurt. This is a real scheduler feature, not a wave-value sweep.
+
+What I implemented:
+
+- Added `mlocal_schedule` to `MegaMoESM90Config`.
+- Added `DG_SM90_MOE_MLOCAL=1` for the cooperative SM90 path, default off.
+- Added `get_next_block_m_local()` in `sm90_mega_moe.cuh`.
+- When M-local is enabled, it overrides the normal expert-local/default scheduler path for that experiment only.
+
+Validation so far:
+
+| check | result |
+| --- | --- |
+| clean wheel build | passed, installed at `/tmp/codex-pr360-site-mlocal-20260624-170911` |
+| installed header contains M-local path | passed |
+| offline NVCC compile, `kMLocalSchedule=true` V4 Pro 384-like instance | passed, cubin `/tmp/codex_mlocal_compile_check.cubin` |
+| offline NVCC compile, `kMLocalSchedule=false` default-like instance | passed, cubin `/tmp/codex_default_compile_check.cubin` |
+| 8-GPU timing | not run yet |
+
+Correction:
+
+I did not run benchmark timing because all 8 GPUs were occupied by another LLaMA training job (`torchrun_main.py`, PIDs `229149-229156`, about `68-85%` GPU utilization and `~9 GB` memory per GPU). Running MegaMoE now would produce polluted numbers. This is exactly the kind of measurement I should reject before it becomes a fake optimization.
+
+Next clean test:
+
+Use the new site only when GPUs are idle:
+
+```bash
+SITE=/tmp/codex-pr360-site-mlocal-20260624-170911
+DG_SM90_MOE_KERNEL=cooperative DG_SM90_MOE_MLOCAL=<0|1> \
+PYTHONPATH=$SITE:/home/chen/workspace/source_code/DeepGEMM/work/codex-pr360/site \
+python3 /tmp/codex-pr360-tests/bench_mega_moe_sm90.py \
+  --num-processes 8 --batches 8192 \
+  --hidden 7168 --intermediate-hidden 3072 \
+  --num-experts 384 --num-topk 6 --num-tests 7
+```
+
+Then repeat MiMo-Pro too (`hidden=6144`, `intermediate=2048`, `topk=8`). If M-local loses, the lesson is still useful: shortening L1-to-L2 phase distance is not free because early L2 blocks can stall on the arrival mask.

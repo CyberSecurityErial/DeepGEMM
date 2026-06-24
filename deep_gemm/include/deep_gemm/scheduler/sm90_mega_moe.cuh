@@ -26,6 +26,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           bool kL2NMajorSchedule = false,
           bool kL1NMajorSchedule = false,
           bool kExpertLocalSchedule = false,
+          bool kMLocalSchedule = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -227,8 +228,36 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block_m_local() {
+        while (current_local_expert_idx < kNumExpertsPerRank) {
+            const auto wave_end_expert_idx = get_wave_expert_end_idx();
+            while (current_local_expert_idx < wave_end_expert_idx) {
+                const auto num_m_blocks = get_current_num_m_blocks();
+                constexpr uint32_t kNumBlocksPerM = kNumL1BlockNs + kNumL2BlockNs;
+                if (block_idx < num_m_blocks * kNumBlocksPerM) {
+                    const uint32_t local_idx = block_idx;
+                    m_block_idx              = local_idx / kNumBlocksPerM;
+                    const uint32_t phase_idx = local_idx - m_block_idx * kNumBlocksPerM;
+                    block_idx += kNumSMs;
+                    if (phase_idx < kNumL1BlockNs) {
+                        n_block_idx = phase_idx;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
+                    n_block_idx = phase_idx - kNumL1BlockNs;
+                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
+                }
+
+                block_idx -= num_m_blocks * kNumBlocksPerM;
+                advance_expert_idx();
+            }
+        }
+        return {BlockPhase::None, 0, 0, 0};
+    }
+
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
+        if constexpr (kMLocalSchedule)
+            return get_next_block_m_local();
         if constexpr (kExpertLocalSchedule)
             return get_next_block_expert_local();
 

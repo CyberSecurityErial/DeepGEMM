@@ -69,6 +69,7 @@ template <
     bool kL2NMajorSchedule,
     bool kL1NMajorSchedule,
     bool kExpertLocalSchedule,
+    bool kMLocalSchedule,
     bool kSFBInSMEM,
     bool kPhaseProfile,
     bool kFuseTopkWeight,
@@ -344,7 +345,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
         kNumSMs, kNumRanks, /*kClusterSize=*/1u, kL2NMajorSchedule, kL1NMajorSchedule,
-        kExpertLocalSchedule>(workspace);
+        kExpertLocalSchedule, kMLocalSchedule>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;

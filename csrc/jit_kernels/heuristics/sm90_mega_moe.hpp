@@ -58,6 +58,10 @@ struct MegaMoESM90Config {
     // then its L2 blocks before advancing to the next expert in the wave.
     bool expert_local_schedule;
 
+    // Experimental M-local phase order: for each expert, run one M block's L1
+    // blocks, then that same M block's L2 blocks before advancing in M.
+    bool mlocal_schedule;
+
     // Experimental path: B-loader warp loads weight scale factors into SMEM
     // per pipeline stage so math warpgroups do not issue global SF loads.
     bool sfb_in_smem;
@@ -79,6 +83,7 @@ struct MegaMoESM90Config {
            << ", l2_nmajor_schedule=" << config.l2_nmajor_schedule
            << ", l1_nmajor_schedule=" << config.l1_nmajor_schedule
            << ", expert_local_schedule=" << config.expert_local_schedule
+           << ", mlocal_schedule=" << config.mlocal_schedule
            << ", sfb_in_smem=" << config.sfb_in_smem
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
@@ -242,6 +247,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
                                         : (nmajor_override != 0);
     const bool l1_nmajor_schedule = false;
     const bool expert_local_schedule = false;
+    const bool mlocal_schedule = false;
     const bool sfb_in_smem = false;
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
@@ -257,7 +263,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, sfb_in_smem,
+        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, mlocal_schedule, sfb_in_smem,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
@@ -354,6 +360,8 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const bool expert_local_schedule = expert_local_override < 0
                                            ? auto_v4_pro_expert_local
                                            : (expert_local_override != 0);
+    // DIAGNOSTIC: DG_SM90_MOE_MLOCAL tests per-M-block L1->L2 scheduling.
+    const bool mlocal_schedule = get_env<int>("DG_SM90_MOE_MLOCAL", 0) != 0;
     // DG_SM90_MOE_SFB_SMEM controls staging weight SF through SMEM:
     //   -1/unspecified: auto, enabled only in the measured medium-long band.
     //    0: force off, 1: force on.
@@ -378,7 +386,7 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
-        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, sfb_in_smem,
+        l2_nmajor_schedule, l1_nmajor_schedule, expert_local_schedule, mlocal_schedule, sfb_in_smem,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
