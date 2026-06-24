@@ -236,47 +236,51 @@ struct MegaMoEScheduler {
                 const auto total_blocks = num_m_blocks * (kNumL1BlockNs + kNumL2BlockNs);
                 if (block_idx < total_blocks) {
                     // Group enough M blocks so the L1 part alone covers at least
-                    // one persistent-grid wave. A one-M group can make many SMs
-                    // immediately take L2 blocks and spin on the L1 arrival mask.
+                    // one persistent-grid wave. Map to the group directly; this
+                    // scheduler runs in the tile hot path for all producer/math roles.
                     constexpr uint32_t kMLocalGroupM = math::constexpr_ceil_div(kNumSMs, kNumL1BlockNs);
+                    constexpr uint32_t kFullGroupBlocks = kMLocalGroupM * (kNumL1BlockNs + kNumL2BlockNs);
+                    const uint32_t num_full_groups = num_m_blocks / kMLocalGroupM;
+                    const uint32_t full_region_blocks = num_full_groups * kFullGroupBlocks;
                     uint32_t local_idx = block_idx;
-                    uint32_t group_m_start = 0;
-                    while (group_m_start < num_m_blocks) {
-                        const uint32_t group_m = cute::min(kMLocalGroupM, num_m_blocks - group_m_start);
-                        const uint32_t group_l1_blocks = group_m * kNumL1BlockNs;
-                        const uint32_t group_l2_blocks = group_m * kNumL2BlockNs;
-                        const uint32_t group_blocks = group_l1_blocks + group_l2_blocks;
-                        if (local_idx < group_blocks) {
-                            block_idx += kNumSMs;
-                            if (local_idx < group_l1_blocks) {
-                                uint32_t m_in_group;
-                                if constexpr (kL1NMajorSchedule) {
-                                    n_block_idx = local_idx / group_m;
-                                    m_in_group = local_idx - n_block_idx * group_m;
-                                } else {
-                                    m_in_group = local_idx / kNumL1BlockNs;
-                                    n_block_idx = local_idx - m_in_group * kNumL1BlockNs;
-                                }
-                                m_block_idx = group_m_start + m_in_group;
-                                return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
-                            }
-
-                            local_idx -= group_l1_blocks;
-                            uint32_t m_in_group;
-                            if constexpr (kL2NMajorSchedule) {
-                                n_block_idx = local_idx / group_m;
-                                m_in_group = local_idx - n_block_idx * group_m;
-                            } else {
-                                m_in_group = local_idx / kNumL2BlockNs;
-                                n_block_idx = local_idx - m_in_group * kNumL2BlockNs;
-                            }
-                            m_block_idx = group_m_start + m_in_group;
-                            return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
-                        }
-
-                        local_idx -= group_blocks;
-                        group_m_start += group_m;
+                    uint32_t group_m_start, group_m;
+                    if (local_idx < full_region_blocks) {
+                        const uint32_t group_idx = local_idx / kFullGroupBlocks;
+                        local_idx -= group_idx * kFullGroupBlocks;
+                        group_m_start = group_idx * kMLocalGroupM;
+                        group_m = kMLocalGroupM;
+                    } else {
+                        local_idx -= full_region_blocks;
+                        group_m_start = num_full_groups * kMLocalGroupM;
+                        group_m = num_m_blocks - group_m_start;
                     }
+
+                    const uint32_t group_l1_blocks = group_m * kNumL1BlockNs;
+                    block_idx += kNumSMs;
+                    if (local_idx < group_l1_blocks) {
+                        uint32_t m_in_group;
+                        if constexpr (kL1NMajorSchedule) {
+                            n_block_idx = local_idx / group_m;
+                            m_in_group = local_idx - n_block_idx * group_m;
+                        } else {
+                            m_in_group = local_idx / kNumL1BlockNs;
+                            n_block_idx = local_idx - m_in_group * kNumL1BlockNs;
+                        }
+                        m_block_idx = group_m_start + m_in_group;
+                        return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
+                    }
+
+                    local_idx -= group_l1_blocks;
+                    uint32_t m_in_group;
+                    if constexpr (kL2NMajorSchedule) {
+                        n_block_idx = local_idx / group_m;
+                        m_in_group = local_idx - n_block_idx * group_m;
+                    } else {
+                        m_in_group = local_idx / kNumL2BlockNs;
+                        n_block_idx = local_idx - m_in_group * kNumL2BlockNs;
+                    }
+                    m_block_idx = group_m_start + m_in_group;
+                    return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
                 }
 
                 block_idx -= total_blocks;

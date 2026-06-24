@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=${ROOT:-/home/chen/workspace/source_code/DeepGEMM}
-SITE=${SITE:-/tmp/codex-pr360-site-mgrouplocal-20260624-172521}
+SITE=${SITE:-/tmp/codex-pr360-site-mgrouplocal-o1-20260624-174251}
 RUNS=${RUNS:-5}
 NUM_TESTS=${NUM_TESTS:-7}
 RUN_ROOT=${RUN_ROOT:-/tmp/codex-pr360-mlocal-confirm-$(date +%Y%m%d-%H%M%S)}

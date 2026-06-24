@@ -1759,3 +1759,49 @@ It compares current default vs `DG_SM90_MOE_MLOCAL=1` for MiMo-Pro 384 and V4 Pr
 Teaching point:
 
 This is a useful correction even before timing. A scheduler order that looks sequential on paper may not be sequential in a persistent-kernel grid. If the first wave already contains consumer tiles, the feature can manufacture idle waiting. That is why I changed the test from one-M local to M-group local before spending GPU time on it.
+
+
+## 2026-06-24: M-group-local O(1) cleanup and 8-GPU result
+
+What I changed before timing:
+
+The corrected M-group-local scheduler still had a small loop to locate the current M group. That loop is not huge, but it is in the tile hot path for producer/math roles. I changed it to direct indexing:
+
+- full groups have a constant size: `group_m * (L1_N_blocks + L2_N_blocks)`;
+- compute `group_idx = local_idx / full_group_blocks`;
+- only the final partial group uses the remainder path.
+
+Why I did this:
+
+If the feature loses, I do not want the result polluted by avoidable scheduler-index overhead. This cleanup makes the experiment mostly test the real idea: does bringing L2 closer to its L1 producer help?
+
+Validation:
+
+| check | result |
+| --- | --- |
+| root/mirror/site header sync | passed |
+| clean wheel build | passed, `/tmp/codex-pr360-site-mgrouplocal-o1-20260624-174251` |
+| offline NVCC compile, M-group-local on | passed, `/tmp/codex_mgrouplocal_o1_compile_check.cubin` |
+| offline NVCC compile, default off | passed, `/tmp/codex_mgrouplocal_o1_default_compile_check.cubin` |
+| dry-run confirm script | passed, `RUNS=0` |
+
+8-GPU result, `8192 tokens/rank`, `RUNS=5`, `NUM_TESTS=7`:
+
+| model | default mean us | M-group-local O(1) mean us | change | wins |
+| --- | ---: | ---: | ---: | ---: |
+| MiMo-Pro 384 | `7290.6 +/- 176.1` | `9202.1 +/- 26.2` | `-20.77%` | `0/5` |
+| V4 Pro 384 | `9701.6 +/- 78.3` | `11354.4 +/- 40.1` | `-14.56%` | `0/5` |
+
+How to read this:
+
+The hypothesis was wrong for these 384-expert cases. Shorter L1-to-L2 distance does not automatically help. The likely reason is that the default schedule gets more global breadth across M/expert work, which hides per-tile and per-expert imbalance better. M-group-local makes the order look cache/locality friendly, but it narrows the active work window; if some L1 tiles or experts lag, more L2 consumers wait instead of the grid finding other independent work.
+
+Decision:
+
+Do not enable `DG_SM90_MOE_MLOCAL` as a default or put it into the best-result table. Keep it as a default-off experiment and as a lesson: before optimizing for locality, check whether the persistent grid needs breadth to hide latency and imbalance.
+
+Raw logs:
+
+```text
+/tmp/codex-pr360-mlocal-confirm-20260624-175454
+```
