@@ -338,11 +338,22 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
     const bool l2_nmajor_schedule = nmajor_override < 0
                                         ? (tokens_per_expert >= 256.0f)
                                         : (nmajor_override != 0);
-    // DIAGNOSTIC: DG_SM90_MOE_L1_NMAJOR overrides the experimental L1 order (-1=auto/off, 0=off, 1=on).
+    // L1 scheduling is model-specific for the long 384-expert PR360 cases.
+    // MiMo-Pro benefits from keeping each L1 weight N tile hot while sweeping M.
+    // V4 Pro only won when L1 N-major was paired with expert-local L1->L2
+    // scheduling, so keep both decisions tied to the measured model shape.
+    const bool auto_mimo_pro_l1_nmajor = is_mimo_pro_384 and tokens_per_expert >= 1024.0f;
+    const bool auto_v4_pro_expert_local = is_v4_pro_384 and tokens_per_expert >= 1024.0f;
+    // DIAGNOSTIC: DG_SM90_MOE_L1_NMAJOR overrides the experimental L1 order (-1=auto, 0=off, 1=on).
     const int l1_nmajor_override = get_env<int>("DG_SM90_MOE_L1_NMAJOR", -1);
-    const bool l1_nmajor_schedule = l1_nmajor_override > 0;
-    // DIAGNOSTIC: DG_SM90_MOE_EXPERT_LOCAL tests per-expert L1->L2 scheduling.
-    const bool expert_local_schedule = get_env<int>("DG_SM90_MOE_EXPERT_LOCAL", 0) != 0;
+    const bool l1_nmajor_schedule = l1_nmajor_override < 0
+                                       ? (auto_mimo_pro_l1_nmajor or auto_v4_pro_expert_local)
+                                       : (l1_nmajor_override != 0);
+    // DIAGNOSTIC: DG_SM90_MOE_EXPERT_LOCAL overrides per-expert L1->L2 scheduling (-1=auto, 0=off, 1=on).
+    const int expert_local_override = get_env<int>("DG_SM90_MOE_EXPERT_LOCAL", -1);
+    const bool expert_local_schedule = expert_local_override < 0
+                                           ? auto_v4_pro_expert_local
+                                           : (expert_local_override != 0);
     // DG_SM90_MOE_SFB_SMEM controls staging weight SF through SMEM:
     //   -1/unspecified: auto, enabled only in the measured medium-long band.
     //    0: force off, 1: force on.
