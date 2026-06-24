@@ -1570,3 +1570,35 @@ Do not enable this by default yet. The next valid step, when GPUs are free, is t
 Teaching point:
 
 This is exactly why repeated measurements matter. A quick sweep is allowed to generate hypotheses. A default heuristic needs repeatable mean/std under a clean GPU. The useful optimization idea here is "model-specific L1 scheduling for long 384-expert cases", but it is not proven yet.
+
+
+## 2026-06-24: L1 schedule confirm script prepared
+
+Why no new timing yet:
+
+I checked again and all 8 GPUs were still occupied by another `torchrun_main.py` LLaMA training job (PIDs `4113728-4113735`, about `97-99%` SM utilization). I did not kill it. Running the 384-expert confirmation now would only reproduce the polluted 14-23 ms numbers from the invalid repeat.
+
+What I did instead:
+
+I added `work/codex-pr360/run_l1_schedule_confirm.sh`. It fixes the exact next clean-GPU experiment:
+
+- MiMo-Pro 384, `8192 tokens/rank`: base vs `DG_SM90_MOE_L1_NMAJOR=1`.
+- V4 Pro 384, `8192 tokens/rank`: base vs `DG_SM90_MOE_L1_NMAJOR=1 DG_SM90_MOE_EXPERT_LOCAL=1`.
+- Default repeat shape: `RUNS=5`, `NUM_TESTS=7`.
+- It reuses the clean current-branch install at `/tmp/codex-pr360-site-current-20260624-140358`, uses separate JIT caches, prints each run, then prints mean/std and speedup.
+
+Dry run:
+
+```bash
+RUNS=0 work/codex-pr360/run_l1_schedule_confirm.sh
+```
+
+This passed and only printed the GPU snapshot plus empty summary. No benchmark was launched.
+
+Next action when GPUs are free:
+
+```bash
+work/codex-pr360/run_l1_schedule_confirm.sh
+```
+
+If MiMo-Pro and V4 Pro both keep positive mean speedup under a clean repeat, then I can safely turn the model-specific L1 schedule rule into a default heuristic. If either one loses the signal, the lesson is still useful: quick sweeps can identify locality hypotheses, but only clean repeated measurements can justify a default.
